@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lochis.watch.lochis-ai</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/gorka/go/bin/lochis</string>
+        <string>watch</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/gorka/sites/somhi-lagunak/sites/lochis.ai</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/gorka/Library/Logs/lochis-lochis-ai.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/gorka/Library/Logs/lochis-lochis-ai.err.log</string>
+</dict>
+</plist>
