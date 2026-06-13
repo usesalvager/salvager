@@ -55,3 +55,31 @@ func TestRootItself(t *testing.T) {
 		t.Error("root dir should not be ignored")
 	}
 }
+
+func TestEditorTempIgnored(t *testing.T) {
+	root := t.TempDir()
+	m := New(root)
+
+	ignored := []string{
+		"a.txt.swp", "a.txt.swo", ".a.txt.swp", // vim swap (hidden or not)
+		"notes~", "src/main.go~", // backups, incl. nested
+		".#main.go",             // emacs lock
+		"#main.go#",             // emacs autosave
+		"4913",                  // vim probe
+		".goutputstream-AB12CD", // gnome/gedit
+		".~lock.report.odt#",    // libreoffice
+	}
+	for _, p := range ignored {
+		if !m.Match(filepath.Join(root, p)) {
+			t.Errorf("expected editor-temp %q ignored", p)
+		}
+	}
+
+	// Real files that merely resemble the patterns must still be tracked.
+	tracked := []string{"main.go", "a.swift", "swap.go", "issue4913.md", "lock.json"}
+	for _, p := range tracked {
+		if m.Match(filepath.Join(root, p)) {
+			t.Errorf("expected %q tracked, got ignored", p)
+		}
+	}
+}
