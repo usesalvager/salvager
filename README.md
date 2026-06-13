@@ -81,6 +81,20 @@ Labels: `initial` · `modify` · `delete` · `pre-restore` · `restore`.
 The project's `.gitignore` plus always-on defaults: `.git`, `.lochis`,
 `node_modules`, `vendor`, `.venv`, `__pycache__`, `target`, `dist`, `build`.
 
+Transient editor artifacts are ignored too — swap, autosave, lock and backup
+files (`*.swp`, `*~`, `.#*`, `#*#`, `4913`, `.goutputstream-*`, `.~lock.*#`).
+The common atomic save (write a temp file, rename it over the target) is
+captured cleanly with no junk history; these patterns additionally suppress the
+long-lived temps (e.g. vim's `.swp` open for a whole session).
+
+Symlinks are never followed — a link could point outside the project or form a
+loop, so its path is skipped. An in-project file that a link points to is still
+versioned under its own real path, so nothing is lost.
+
+Renaming a file is recorded as a delete of the old path plus a fresh history at
+the new path — history is **not** transferred to the new path, but it stays
+fully recoverable under the old one (`lochis history old.txt` / `restore`).
+
 ## Retention
 
 `lochis gc` drops revisions older than N days (default 7) and garbage-collects
@@ -93,3 +107,16 @@ In: watcher, per-file store, list/get/restore/record, pre-restore safeguard,
 
 Out: branches, merge, sync, cloud, accounts, config files, web UI, RBAC,
 rendered diffs, explicit checkpoints, size-based retention.
+
+## Known limits (v1)
+
+- **Large files** are read whole into memory on each capture — no streaming hash
+  and no size cap. Multi-MB files are fine; files of hundreds of MB cause a
+  memory spike per capture. (A documented size limit/skip is a candidate for v2.)
+- **inotify watch limit (Linux)**: each directory consumes one watch. If
+  `fs.inotify.max_user_watches` is reached, the watcher logs the failed
+  `watch add` for the affected directories rather than failing silently — raise
+  the sysctl for very large trees.
+- **Symlinks** are skipped, not followed (see above).
+- **Long-running**: no known leak of memory or file descriptors; not yet
+  validated by a multi-hour soak test.

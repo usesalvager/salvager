@@ -78,6 +78,9 @@ func (w *Watcher) initialScan() error {
 			}
 			return nil
 		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil // never follow symlinks (may point outside the project)
+		}
 		if d.IsDir() {
 			if err := w.fsw.Add(path); err != nil {
 				log.Printf("lochis: watch add %s: %v", path, err)
@@ -103,6 +106,9 @@ func (w *Watcher) addTree(dir string) {
 				return filepath.SkipDir
 			}
 			return nil
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil // never follow symlinks (may point outside the project)
 		}
 		if d.IsDir() {
 			if err := w.fsw.Add(path); err != nil {
@@ -139,6 +145,12 @@ func (w *Watcher) Run(done <-chan struct{}) error {
 				return nil
 			}
 			if w.ign.Match(ev.Name) {
+				continue
+			}
+			// Never follow symlinks: a link can point outside the project or
+			// form a loop. Lstat inspects the link itself, not its target. A
+			// missing path (Lstat error) falls through so deletions still record.
+			if fi, err := os.Lstat(ev.Name); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
 				continue
 			}
 			// A newly created directory must be registered (and scanned),

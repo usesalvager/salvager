@@ -69,6 +69,17 @@ func New(root string) *FS {
 	return &FS{root: root}
 }
 
+// Init eagerly creates the .lochis/ skeleton (objects/ and index/). The watcher
+// calls this on startup so `lochis watch` materializes the history directory
+// immediately, even in an empty project before the first change. Read-only
+// entry points (history/show) still create nothing.
+func (s *FS) Init() error {
+	if err := os.MkdirAll(s.objectsDir(), 0o755); err != nil {
+		return err
+	}
+	return os.MkdirAll(s.indexDir(), 0o755)
+}
+
 func (s *FS) dir() string        { return filepath.Join(s.root, Dir) }
 func (s *FS) objectsDir() string { return filepath.Join(s.dir(), "objects") }
 func (s *FS) indexDir() string   { return filepath.Join(s.dir(), "index") }

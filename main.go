@@ -74,6 +74,9 @@ func main() {
 
 func cmdWatch(root string) {
 	s := store.New(root)
+	if err := s.Init(); err != nil {
+		fatal(err)
+	}
 	w, err := watch.New(root, s, ignore.New(root))
 	if err != nil {
 		fatal(err)

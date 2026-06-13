@@ -26,6 +26,23 @@ var Defaults = []string{
 	"build",
 }
 
+// EditorTemp are glob patterns (matched against a path's basename) for transient
+// editor artifacts — swap, autosave, lock and backup files. They are not project
+// content. Without them, an editor temp that outlives the debounce window (e.g.
+// vim's .swp, open for the whole session, or emacs's #file# autosave) would get
+// its own spurious revision + delete on every edit. The common atomic-save
+// pattern (write temp, rename over the target) is already clean because the temp
+// is gone before the debounce fires; these patterns cover the long-lived ones.
+var EditorTemp = []string{
+	"*.swp", "*.swo", "*.swn", // vim swap
+	"*~",               // emacs/gedit/joe/nano backup
+	".#*",              // emacs lock
+	"#*#",              // emacs autosave
+	"4913",             // vim write-permission probe file
+	".goutputstream-*", // GNOME / gedit
+	".~lock.*#",        // LibreOffice
+}
+
 // Matcher answers whether a path should be ignored.
 type Matcher struct {
 	root     string
@@ -69,8 +86,17 @@ func (m *Matcher) Match(path string) bool {
 		return true
 	}
 
-	for _, comp := range strings.Split(rel, "/") {
+	parts := strings.Split(rel, "/")
+	for _, comp := range parts {
 		if _, ok := m.defaults[comp]; ok {
+			return true
+		}
+	}
+
+	// Transient editor artifacts, matched on the basename.
+	base := parts[len(parts)-1]
+	for _, p := range EditorTemp {
+		if ok, _ := filepath.Match(p, base); ok {
 			return true
 		}
 	}
