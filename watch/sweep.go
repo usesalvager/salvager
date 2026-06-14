@@ -20,11 +20,15 @@ import (
 //
 // It reconciles, it does not merely restate: every pass re-enumerates the
 // overflow subtree with filepath.WalkDir, so files created while unwatched are
-// discovered, not just changes to files we already knew. A stat (mtime+size)
-// gates the expensive step: only when a file's stat moved do we call
-// store.Record, which reads and content-hashes it; identical content is
-// deduplicated away, so a touched-but-unchanged file costs one stat and zero
-// writes. False positives from the coarse stat signal are absorbed for free.
+// discovered, not just changes to files we already knew. A stat (mtime+ctime+
+// size, see fileState) gates the expensive step: only when a file's stat moved
+// do we call store.Record, which reads and content-hashes it; identical content
+// is deduplicated away, so a touched-but-unchanged file costs one stat and zero
+// writes. False positives from the stat signal are absorbed for free by the
+// hash dedup; the one false-negative the gate must not have — a content change
+// that leaves the stat untouched — is closed by ctime (which a content write
+// always advances and utimes cannot rewind), with a narrow residual on
+// coarse-timestamp filesystems documented on fileState.
 //
 // I/O cost of a sweep (measured — Apple M2 Pro, APFS, go1.25, 88,000 files
 // across 8,800 directories; reproduce with `LOCHIS_SWEEP_BENCH=1 go test
@@ -77,10 +81,29 @@ type sweeper struct {
 	stats sweepStats
 }
 
-// fileState is the cheap change signal: a file whose mtime and size both match
-// the last sweep is assumed unchanged and is not read.
+// fileState is the cheap change signal: a file whose mtime, ctime and size all
+// match the last sweep is assumed unchanged and is not read.
+//
+// ctime (inode change time) is the load-bearing addition over a naive mtime+size
+// gate. mtime alone has a silent blind spot: an in-place rewrite (same byte
+// length) that also restores the old mtime — utimes, `cp --preserve`, an
+// mtime-preserving formatter, tar/rsync extraction — would leave mtime and size
+// identical, and a pure mtime+size gate would skip the file and freeze it at
+// stale content (the real-time path records on the write regardless, so polling
+// would silently lose an edit the watch would have caught). ctime closes that:
+// the kernel bumps ctime on every content write and it CANNOT be set backwards
+// by utimes, so the rewrite is always observed. Where the OS exposes no ctime
+// (non-unix), ctimeNano returns 0 and the gate degrades to mtime+size.
+//
+// Residual limit: on a coarse-granularity filesystem (≥1s timestamp resolution —
+// FAT, some network mounts), two same-size in-place writes within one tick can
+// collide on both mtime and ctime and be missed until the next stat-moving
+// change. This is inherent to stat-based polling and does not affect the
+// documented APFS/ext4 targets (nanosecond resolution); the real-time path is
+// never affected.
 type fileState struct {
 	mtime int64 // unix nanoseconds
+	ctime int64 // unix nanoseconds; 0 where the OS exposes no ctime
 	size  int64
 }
 
@@ -159,7 +182,13 @@ func (sw *sweeper) active() bool {
 // even when a huge overflow region makes each pass expensive; sw.interval is the
 // floor (and the value tests pin small).
 func (sw *sweeper) run(done <-chan struct{}) {
-	wait := sw.interval
+	// Immediate first pass: overflow subtrees registered during the initial scan
+	// get their initial revisions with walk-time latency, not after a full
+	// interval — closing the startup window in which an overflow file would
+	// otherwise have no recorded revision at all.
+	start := time.Now()
+	sw.sweepRoots()
+	wait := sw.nextWait(time.Since(start))
 	for {
 		select {
 		case <-done:
@@ -292,7 +321,7 @@ func (sw *sweeper) walkRecord(dir string, recursive bool, present map[string]boo
 			return nil
 		}
 		atomic.AddInt64(&sw.stats.files, 1)
-		st := fileState{mtime: info.ModTime().UnixNano(), size: info.Size()}
+		st := fileState{mtime: info.ModTime().UnixNano(), ctime: ctimeNano(info), size: info.Size()}
 
 		sw.mu.Lock()
 		cached, ok := sw.seen[rel]

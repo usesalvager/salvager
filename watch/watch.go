@@ -129,11 +129,18 @@ func (w *Watcher) initialScan() error {
 		}
 		if d.IsDir() {
 			if err := w.backend.AddDir(path); err != nil {
-				if isDescriptorLimit(err) {
-					w.sweeper.addRoot(path) // cover by polling, silently
-					return filepath.SkipDir // the sweep owns this subtree now
+				// ANY directory we could not place under a live watch is handed
+				// to the polling sweep — not only the classified descriptor
+				// limit — so coverage stays whole regardless of why the backend
+				// refused. The descriptor limit is the expected, silent case;
+				// anything else (an unclassified overflow errno, a transient
+				// backend error, EACCES) is unexpected and worth one log line,
+				// but it is covered all the same rather than silently dropped.
+				if !isDescriptorLimit(err) {
+					log.Printf("lochis: watch add %s: %v (covering by polling)", path, err)
 				}
-				log.Printf("lochis: watch add %s: %v", path, err)
+				w.sweeper.addRoot(path)
+				return filepath.SkipDir // the sweep owns this subtree now
 			}
 			return nil
 		}
@@ -164,11 +171,13 @@ func (w *Watcher) addTree(dir string) {
 		}
 		if d.IsDir() {
 			if err := w.backend.AddDir(path); err != nil {
-				if isDescriptorLimit(err) {
-					w.sweeper.addRoot(path)
-					return filepath.SkipDir
+				// Any AddDir failure -> polling, so a directory appearing at
+				// runtime that the backend refuses is covered, not dropped.
+				if !isDescriptorLimit(err) {
+					log.Printf("lochis: watch add %s: %v (covering by polling)", path, err)
 				}
-				log.Printf("lochis: watch add %s: %v", path, err)
+				w.sweeper.addRoot(path)
+				return filepath.SkipDir
 			}
 			return nil
 		}

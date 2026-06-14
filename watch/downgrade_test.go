@@ -33,11 +33,12 @@ import (
 // events: the point is precisely that overflow directories are covered by
 // polling, not by the backend.
 type fakeBackend struct {
-	events chan Event
-	errs   chan error
-	mu     sync.Mutex
-	added  []string
-	fail   func(dir string) bool
+	events  chan Event
+	errs    chan error
+	mu      sync.Mutex
+	added   []string
+	fail    func(dir string) bool
+	failErr error // returned when fail() is true; defaults to EMFILE
 }
 
 func newFakeBackend(fail func(dir string) bool) *fakeBackend {
@@ -50,6 +51,9 @@ func newFakeBackend(fail func(dir string) bool) *fakeBackend {
 
 func (f *fakeBackend) AddDir(dir string) error {
 	if f.fail != nil && f.fail(dir) {
+		if f.failErr != nil {
+			return f.failErr
+		}
 		return syscall.EMFILE // exactly what kqueue returns at kern.maxfilesperproc
 	}
 	f.mu.Lock()
@@ -74,12 +78,20 @@ func dgRevCount(s *store.FS, rel string) int {
 // overflowDir, so that subtree is forced onto the polling sweep. The sweep runs
 // fast so tests stay quick.
 func startOverflow(t *testing.T, root, overflowDir string) (*store.FS, *Watcher, func()) {
+	return startOverflowErr(t, root, overflowDir, nil)
+}
+
+// startOverflowErr is startOverflow with a chosen AddDir failure error, so tests
+// can prove that a NON-descriptor-limit backend error is still covered by
+// polling, not silently dropped.
+func startOverflowErr(t *testing.T, root, overflowDir string, failErr error) (*store.FS, *Watcher, func()) {
 	t.Helper()
 	s := store.New(root)
 	if err := s.Init(); err != nil {
 		t.Fatal(err)
 	}
 	fake := newFakeBackend(func(dir string) bool { return underPath(dir, overflowDir) })
+	fake.failErr = failErr
 	w := newWithBackend(root, s, ignore.New(root), fake)
 	w.debounce = 40 * time.Millisecond
 	w.sweeper.interval = 25 * time.Millisecond
@@ -114,7 +126,9 @@ func TestDowngradeOverflowFileAccumulatesHistory(t *testing.T) {
 	}
 
 	// Two edits, each separated past the poll interval so each is its own pass.
-	for _, v := range []string{"v1", "v2"} {
+	// Contents differ in length so the change is detected regardless of
+	// filesystem timestamp resolution.
+	for _, v := range []string{"v1-edit", "v2-edited"} {
 		time.Sleep(120 * time.Millisecond)
 		if err := os.WriteFile(path, []byte(v), 0o644); err != nil {
 			t.Fatal(err)
@@ -246,6 +260,16 @@ func TestDowngradeFullCoverageUnderOverflow(t *testing.T) {
 	}) {
 		t.Fatal("100%% coverage failed: some overflow file did not reach its edited content")
 	}
+
+	// No spurious re-records: each file is exactly initial + one edit. A
+	// regression that re-recorded unchanged files every pass would blow past 2.
+	for _, d := range []int{0, dirs / 2, dirs - 1} {
+		for _, f := range []int{0, perDir - 1} {
+			if n := dgRevCount(s, relOf(d, f)); n != 2 {
+				t.Errorf("%s has %d revisions, want exactly 2 (initial+edit); spurious re-record?", relOf(d, f), n)
+			}
+		}
+	}
 }
 
 // D4 — the degradation policy. With polling unavailable and overflow present,
@@ -253,7 +277,7 @@ func TestDowngradeFullCoverageUnderOverflow(t *testing.T) {
 // it runs, having been told to. The invariant: partial coverage is reachable
 // only by explicit choice, never by default and never silent.
 func TestDowngradePartialCoveragePolicy(t *testing.T) {
-	makeWatcher := func(t *testing.T) (*Watcher, func()) {
+	makeWatcher := func(t *testing.T) (*Watcher, *store.FS, string, func()) {
 		t.Helper()
 		root := t.TempDir()
 		big := filepath.Join(root, "big")
@@ -270,12 +294,12 @@ func TestDowngradePartialCoveragePolicy(t *testing.T) {
 		fake := newFakeBackend(func(dir string) bool { return underPath(dir, big) })
 		w := newWithBackend(root, s, ignore.New(root), fake)
 		w.pollDisabled = true // simulate "polling unavailable for some reason"
-		return w, func() { w.Close() }
+		return w, s, root, func() { w.Close() }
 	}
 
 	// Without --allow-partial: refuse.
 	t.Run("refuses without flag", func(t *testing.T) {
-		w, closeW := makeWatcher(t)
+		w, _, _, closeW := makeWatcher(t)
 		defer closeW()
 		errc := make(chan error, 1)
 		done := make(chan struct{})
@@ -291,9 +315,12 @@ func TestDowngradePartialCoveragePolicy(t *testing.T) {
 		}
 	})
 
-	// With --allow-partial: run (do not refuse).
+	// With --allow-partial: run (do not refuse) AND coverage is genuinely
+	// partial — the overflow file is neither watched nor polled, so it gets no
+	// revision. This proves the flag means what it says rather than quietly
+	// re-enabling full coverage.
 	t.Run("runs with flag", func(t *testing.T) {
-		w, closeW := makeWatcher(t)
+		w, s, _, closeW := makeWatcher(t)
 		defer closeW()
 		w.SetAllowPartial(true)
 		errc := make(chan error, 1)
@@ -304,6 +331,9 @@ func TestDowngradePartialCoveragePolicy(t *testing.T) {
 			t.Fatalf("--allow-partial should run, not refuse; got %v", err)
 		case <-time.After(400 * time.Millisecond):
 			// Still running in (accepted) partial mode: correct.
+		}
+		if n := dgRevCount(s, filepath.Join("big", "f.txt")); n != 0 {
+			t.Errorf("under --allow-partial the overflow file should be uncovered (0 revisions), got %d", n)
 		}
 		close(done)
 	})
@@ -371,5 +401,83 @@ func TestDowngradeSimulatedDropRecovery(t *testing.T) {
 	cRevs, _ := s.List(filepath.Join("sub", "c.txt"))
 	if len(cRevs) < 2 || cRevs[0].Label != store.LabelDelete {
 		t.Errorf("lost deletion not recovered: c.txt latest label = %v", cRevs[0].Label)
+	}
+}
+
+// D6 — a backend error that is NOT the classified descriptor limit must still be
+// covered by polling, not silently dropped. The original failure mode is wider
+// than EMFILE: any AddDir failure (a transient backend error, an unclassified or
+// localized overflow errno) left the directory both unwatched and unpolled. The
+// contract is that ANY directory the backend refuses goes to the sweep.
+func TestDowngradeNonLimitErrorCoveredByPolling(t *testing.T) {
+	root := t.TempDir()
+	big := filepath.Join(root, "big")
+	if err := os.MkdirAll(big, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(big, "f.txt"), []byte("v0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, _, stop := startOverflowErr(t, root, big, errors.New("transient backend failure"))
+	defer stop()
+
+	rel := filepath.Join("big", "f.txt")
+	if !waitFor(t, 3*time.Second, func() bool { return dgRevCount(s, rel) >= 1 }) {
+		t.Fatal("dir refused with a non-descriptor-limit error was not covered by polling (silent partial coverage)")
+	}
+	// And it keeps tracking edits, proving genuine polling coverage, not a fluke.
+	time.Sleep(120 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(root, rel), []byte("v1-longer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(t, 3*time.Second, func() bool {
+		revs, _ := s.List(rel)
+		if len(revs) < 2 {
+			return false
+		}
+		got, _ := s.Get(rel, revs[0].Timestamp)
+		return bytes.Equal(got, []byte("v1-longer"))
+	}) {
+		t.Fatal("non-limit-error directory was not tracked by polling after initial coverage")
+	}
+}
+
+// D7 — deletion through the WIRED polling path. sweepRoots detects deletes by
+// diffing its in-memory seen set (a different mechanism from ReconcileTree's
+// store-index diff exercised by D5). This drives a real Watcher so the
+// production seen-diff delete arm is guarded, not just the one-shot primitive.
+func TestDowngradeOverflowDeleteViaPolling(t *testing.T) {
+	root := t.TempDir()
+	big := filepath.Join(root, "big")
+	if err := os.MkdirAll(big, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(big, "doomed.txt")
+	if err := os.WriteFile(p, []byte("here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, _, stop := startOverflow(t, root, big)
+	defer stop()
+
+	rel := filepath.Join("big", "doomed.txt")
+	// First the sweep must record it (so its stat is in the seen set).
+	if !waitFor(t, 3*time.Second, func() bool { return dgRevCount(s, rel) >= 1 }) {
+		t.Fatal("overflow file never got an initial revision via polling")
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(t, 3*time.Second, func() bool {
+		revs, _ := s.List(rel)
+		return len(revs) >= 2 && revs[0].Label == store.LabelDelete
+	}) {
+		revs, _ := s.List(rel)
+		var labels []string
+		for _, r := range revs {
+			labels = append(labels, string(r.Label))
+		}
+		t.Fatalf("deletion in an overflow dir not recovered via the polling seen-diff; labels=%v", labels)
 	}
 }
