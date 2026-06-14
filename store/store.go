@@ -364,6 +364,83 @@ func (s *FS) Restore(relPath string, ts int64) (int64, error) {
 	return preTs.Timestamp, nil
 }
 
+// TrackedUnder returns the relPaths of files the store already has history for
+// that live under relDir (relDir == "" means the whole tree). With recursive
+// false only direct children of relDir are returned; with true the entire
+// subtree. A file whose latest revision is a deletion is excluded — it is
+// already known gone, so it must not be re-reported as a fresh delete.
+//
+// The watch reconciliation sweep uses this to detect files that vanished while
+// their directory was covered by polling (or by an FSEvents directory rescan):
+// a path the store knows but disk no longer holds is a delete. This reads only
+// the index/ side (one ReadDir or WalkDir of small log files), never object
+// content, so it stays cheap relative to the disk-side stat pass.
+func (s *FS) TrackedUnder(relDir string, recursive bool) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	base := s.indexDir()
+	if relDir != "" && relDir != "." {
+		base = filepath.Join(base, relDir)
+	}
+
+	collect := func(logRel string) []string {
+		// logRel is the path under indexDir, ".log" still attached.
+		if !strings.HasSuffix(logRel, ".log") {
+			return nil
+		}
+		rel := strings.TrimSuffix(logRel, ".log")
+		if last, ok := s.lastRevision(rel); !ok || last.Label == LabelDelete {
+			return nil
+		}
+		return []string{rel}
+	}
+
+	var out []string
+	if recursive {
+		err := filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			if d.IsDir() {
+				return nil
+			}
+			rel, err := filepath.Rel(s.indexDir(), path)
+			if err != nil {
+				return err
+			}
+			out = append(out, collect(rel)...)
+			return nil
+		})
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return out, err
+	}
+
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		logRel := e.Name()
+		if relDir != "" && relDir != "." {
+			logRel = filepath.Join(relDir, e.Name())
+		}
+		out = append(out, collect(logRel)...)
+	}
+	return out, nil
+}
+
 // GC removes revisions older than maxAge and any objects no longer referenced
 // by any log (reference-counted garbage collection).
 func (s *FS) GC(maxAge time.Duration) error {

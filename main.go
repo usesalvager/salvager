@@ -31,7 +31,7 @@ import (
 const usage = `lochis — local history for agents
 
 Usage:
-  lochis watch                    start the watcher (runs until killed)
+  lochis watch [--allow-partial]  start the watcher (runs until killed)
   lochis history <file>           list recorded versions of a file
   lochis show <file> <timestamp>  print the content of one version
   lochis restore <file> <ts>      restore a file to a version (reversible)
@@ -53,7 +53,7 @@ func main() {
 	args := os.Args[2:]
 	switch os.Args[1] {
 	case "watch":
-		cmdWatch(root)
+		cmdWatch(root, args)
 	case "history":
 		cmdHistory(root, args)
 	case "show":
@@ -72,7 +72,17 @@ func main() {
 	}
 }
 
-func cmdWatch(root string) {
+func cmdWatch(root string, args []string) {
+	allowPartial := false
+	for _, a := range args {
+		switch a {
+		case "--allow-partial":
+			allowPartial = true
+		default:
+			fatalf("usage: lochis watch [--allow-partial]")
+		}
+	}
+
 	s := store.New(root)
 	if err := s.Init(); err != nil {
 		fatal(err)
@@ -81,6 +91,7 @@ func cmdWatch(root string) {
 	if err != nil {
 		fatal(err)
 	}
+	w.SetAllowPartial(allowPartial)
 	defer w.Close()
 
 	done := make(chan struct{})
