@@ -95,12 +95,19 @@ type sweeper struct {
 // by utimes, so the rewrite is always observed. Where the OS exposes no ctime
 // (non-unix), ctimeNano returns 0 and the gate degrades to mtime+size.
 //
-// Residual limit: on a coarse-granularity filesystem (≥1s timestamp resolution —
-// FAT, some network mounts), two same-size in-place writes within one tick can
-// collide on both mtime and ctime and be missed until the next stat-moving
-// change. This is inherent to stat-based polling and does not affect the
-// documented APFS/ext4 targets (nanosecond resolution); the real-time path is
-// never affected.
+// Residual limit (the relevant instance is the Linux cloud path, NFS — not just
+// legacy disks): the stat gate assumes timestamps advance and are current. On a
+// coarse-granularity filesystem (≥1s resolution — notably some NFS mounts, e.g.
+// NFSv3; also FAT), two same-size in-place writes within one tick can collide on
+// both mtime and ctime and be missed until the next stat-moving change. NFS
+// attribute caching adds a visibility lag on top, though lochis normally runs on
+// the same host as the writer, where close-to-open consistency makes the client
+// observe its own writes (cross-host NFS sharing is the corner). This only bites
+// in overflow/polling mode and self-heals on the next stat-moving change; local
+// nanosecond-resolution filesystems — the typical container ext4/overlay, and
+// the APFS dev target — are unaffected, and the real-time path never is. If
+// cloud NFS overflow ever proves to matter, the evidence-gated mitigation is a
+// periodic full re-hash pass that bounds staleness regardless of stat quirks.
 type fileState struct {
 	mtime int64 // unix nanoseconds
 	ctime int64 // unix nanoseconds; 0 where the OS exposes no ctime

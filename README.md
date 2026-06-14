@@ -153,6 +153,14 @@ rendered diffs, explicit checkpoints, size-based retention.
   deferred — the cgo dependency and loss of the static binary are not justified
   by the measured disk cost, only by this CPU cost, which has not yet proven
   painful in practice.
+- **Coarse-timestamp / NFS polling residual**: the polling fallback detects
+  changes by stat (mtime+ctime+size). On a filesystem with ≥1s timestamp
+  resolution — some NFS mounts (e.g. NFSv3), FAT — two same-size in-place writes
+  to one file within a single tick can be missed until the next stat-moving
+  change. This only applies to overflow subtrees under polling (not the
+  real-time path) and self-heals on the next change; nanosecond-resolution
+  filesystems (ext4/overlay in typical Linux containers, APFS) are unaffected.
+  Relevant mainly to NFS-backed working trees on the cloud path.
 - **Symlinks** are skipped, not followed (see above).
 - **Long-running**: no known leak of memory or file descriptors; not yet
   validated by a multi-hour soak test.
