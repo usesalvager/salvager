@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"lochis/ignore"
-	"lochis/store"
+	"github.com/usesalvager/salvager/ignore"
+	"github.com/usesalvager/salvager/store"
 )
 
 // TestSweepGateZeroReadsWhenUnchanged guards the load-bearing I/O invariant in
@@ -155,14 +155,14 @@ func TestSweeperAddRootDedup(t *testing.T) {
 
 // TestSweepIOCost measures the I/O cost of a reconciliation pass across ~88k
 // files — the worst case from the scaling sweep where the descriptor cap is
-// exhausted. It is gated behind LOCHIS_SWEEP_BENCH=1 because building 88k files
+// exhausted. It is gated behind SALVAGER_SWEEP_BENCH=1 because building 88k files
 // is far too heavy for the normal suite. The numbers it prints are what the
 // sweep.go header comment documents. Run:
 //
-//	LOCHIS_SWEEP_BENCH=1 go test ./watch -run TestSweepIOCost -v -timeout 20m
+//	SALVAGER_SWEEP_BENCH=1 go test ./watch -run TestSweepIOCost -v -timeout 20m
 func TestSweepIOCost(t *testing.T) {
-	if os.Getenv("LOCHIS_SWEEP_BENCH") == "" {
-		t.Skip("set LOCHIS_SWEEP_BENCH=1 to run the 88k-file I/O measurement")
+	if os.Getenv("SALVAGER_SWEEP_BENCH") == "" {
+		t.Skip("set SALVAGER_SWEEP_BENCH=1 to run the 88k-file I/O measurement")
 	}
 
 	const (

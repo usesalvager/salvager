@@ -13,7 +13,7 @@ func TestDefaultExcludes(t *testing.T) {
 	ignored := []string{
 		"node_modules/react/index.js",
 		".git/config",
-		".lochis/objects/abc",
+		".salvager/objects/abc",
 		"vendor/foo.php",
 		"src/__pycache__/x.pyc",
 		"target/debug/app",

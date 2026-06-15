@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"lochis/ignore"
-	"lochis/store"
+	"github.com/usesalvager/salvager/ignore"
+	"github.com/usesalvager/salvager/store"
 )
 
 // stressStart wires a real store + ignore matcher and starts the watcher in a
@@ -479,7 +479,7 @@ func TestStressB3_5UnreadableFileKeepsWatcherAlive(t *testing.T) {
 }
 
 // B6.3 — watcher restart must not duplicate 'initial' revisions for unchanged
-// files. Populate .lochis/ with a first run, stop it, then start a SECOND
+// files. Populate .salvager/ with a first run, stop it, then start a SECOND
 // watcher with the files UNCHANGED: no new revisions may be appended. Critical.
 func TestStressB6_3RestartNoDuplicate(t *testing.T) {
 	root := t.TempDir()
@@ -490,7 +490,7 @@ func TestStressB6_3RestartNoDuplicate(t *testing.T) {
 		}
 	}
 
-	// First watcher run: populate .lochis/.
+	// First watcher run: populate .salvager/.
 	s1, stop1 := stressStart(t, root, 80*time.Millisecond)
 	if !waitFor(t, 3*time.Second, func() bool {
 		for _, f := range files {

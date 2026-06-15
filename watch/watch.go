@@ -19,7 +19,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"lochis/ignore"
+	"github.com/usesalvager/salvager/ignore"
 )
 
 // Recorder is the slice of the store the watcher needs.
@@ -41,10 +41,10 @@ const (
 
 // ErrPartialCoverage is returned by Run when real-time watches fell short and
 // polling is unavailable to cover the gap, and the operator did not pass
-// --allow-partial. Refusing here is the safety rule: Lochis must not silently
+// --allow-partial. Refusing here is the safety rule: Salvager must not silently
 // run without full coverage.
 var ErrPartialCoverage = errors.New(
-	"lochis: real-time watch limit reached and polling is unavailable; " +
+	"salvager: real-time watch limit reached and polling is unavailable; " +
 		"refusing to run with partial coverage (pass --allow-partial to override)")
 
 // Watcher couples the OS backend, the ignore matcher, the store and the polling
@@ -137,7 +137,7 @@ func (w *Watcher) initialScan() error {
 				// backend error, EACCES) is unexpected and worth one log line,
 				// but it is covered all the same rather than silently dropped.
 				if !isDescriptorLimit(err) {
-					log.Printf("lochis: watch add %s: %v (covering by polling)", path, err)
+					log.Printf("salvager: watch add %s: %v (covering by polling)", path, err)
 				}
 				w.sweeper.addRoot(path)
 				return filepath.SkipDir // the sweep owns this subtree now
@@ -145,7 +145,7 @@ func (w *Watcher) initialScan() error {
 			return nil
 		}
 		if err := w.store.Record(w.rel(path)); err != nil {
-			log.Printf("lochis: initial record %s: %v", path, err)
+			log.Printf("salvager: initial record %s: %v", path, err)
 		}
 		return nil
 	})
@@ -174,7 +174,7 @@ func (w *Watcher) addTree(dir string) {
 				// Any AddDir failure -> polling, so a directory appearing at
 				// runtime that the backend refuses is covered, not dropped.
 				if !isDescriptorLimit(err) {
-					log.Printf("lochis: watch add %s: %v (covering by polling)", path, err)
+					log.Printf("salvager: watch add %s: %v (covering by polling)", path, err)
 				}
 				w.sweeper.addRoot(path)
 				return filepath.SkipDir
@@ -182,7 +182,7 @@ func (w *Watcher) addTree(dir string) {
 			return nil
 		}
 		if err := w.store.Record(w.rel(path)); err != nil {
-			log.Printf("lochis: record %s: %v", path, err)
+			log.Printf("salvager: record %s: %v", path, err)
 		}
 		return nil
 	})
@@ -247,14 +247,14 @@ func (w *Watcher) Run(done <-chan struct{}) error {
 			if !ok {
 				return nil
 			}
-			log.Printf("lochis: watch error: %v", err)
+			log.Printf("salvager: watch error: %v", err)
 
 		case <-ticker.C:
 			now := nowFunc()
 			for path, last := range pending {
 				if now.Sub(last) > w.debounce {
 					if err := w.store.Record(w.rel(path)); err != nil {
-						log.Printf("lochis: record %s: %v", w.rel(path), err)
+						log.Printf("salvager: record %s: %v", w.rel(path), err)
 					}
 					delete(pending, path)
 				}

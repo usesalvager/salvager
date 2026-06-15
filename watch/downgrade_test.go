@@ -12,14 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"lochis/ignore"
-	"lochis/store"
+	"github.com/usesalvager/salvager/ignore"
+	"github.com/usesalvager/salvager/store"
 )
 
 // These tests make the discovered failure mode a permanent regression surface.
-// They prove Lochis fails CORRECTLY, not just that it captures correctly: when
+// They prove Salvager fails CORRECTLY, not just that it captures correctly: when
 // the kernel watch cap is hit, polling takes over automatically and coverage
-// stays whole; and when polling is taken away, Lochis refuses to run partial
+// stays whole; and when polling is taken away, Salvager refuses to run partial
 // rather than degrade silently.
 //
 // The descriptor limit is injected through a fake backend, because a real
@@ -273,7 +273,7 @@ func TestDowngradeFullCoverageUnderOverflow(t *testing.T) {
 }
 
 // D4 — the degradation policy. With polling unavailable and overflow present,
-// Lochis REFUSES to run rather than silently lose coverage; with --allow-partial
+// Salvager REFUSES to run rather than silently lose coverage; with --allow-partial
 // it runs, having been told to. The invariant: partial coverage is reachable
 // only by explicit choice, never by default and never silent.
 func TestDowngradePartialCoveragePolicy(t *testing.T) {

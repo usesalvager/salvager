@@ -25,7 +25,7 @@ LAT_SAMPLES="${LAT_SAMPLES:-20}"
 # files:dirs pairs, smallest first.
 SCALES="${SCALES:-20000:2000 100000:10000 200000:20000}"
 
-[ -x "$REPO/lochis" ] || { echo "build first: (cd $REPO && go build -o lochis .)" >&2; exit 1; }
+[ -x "$REPO/salvager" ] || { echo "build first: (cd $REPO && go build -o salvager .)" >&2; exit 1; }
 
 commit="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 when="$(date -u '+%Y-%m-%d %H:%M:%SZ')"
@@ -42,7 +42,7 @@ fi
 go_ver="$(go version 2>/dev/null | awk '{print $3}')"
 
 {
-  echo "# lochis v1 — scaling sweep"
+  echo "# salvager v1 — scaling sweep"
   echo
   echo "Reproduce: \`bench/sweep.sh\`. Method and caveats: \`bench/PROTOCOL.md\`."
   echo

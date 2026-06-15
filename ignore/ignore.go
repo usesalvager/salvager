@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	gitignore "github.com/sabhiram/go-gitignore"
-	"lochis/store"
+	"github.com/usesalvager/salvager/store"
 )
 
 // Defaults are always excluded. We watch foreign working trees of any
@@ -16,7 +16,7 @@ import (
 // it the watcher would record its own recordings in a loop.
 var Defaults = []string{
 	".git",
-	store.Dir, // ".lochis"
+	store.Dir, // ".salvager"
 	"node_modules",
 	"vendor",
 	".venv",

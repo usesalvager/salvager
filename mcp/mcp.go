@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"lochis/store"
+	"github.com/usesalvager/salvager/store"
 )
 
 // Backend is the slice of the store the MCP server consumes.
@@ -77,17 +77,17 @@ func short(hash string) string {
 
 // NewServer builds the MCP server backed by b.
 func NewServer(b Backend) *mcp.Server {
-	s := mcp.NewServer(&mcp.Implementation{Name: "lochis", Version: "1.0.0"}, nil)
+	s := mcp.NewServer(&mcp.Implementation{Name: "salvager", Version: "1.0.0"}, nil)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "lochis_list_versions",
+		Name: "salvager_list_versions",
 		Description: "List the recorded versions of a file, most recent first. " +
 			"Each version carries a content signal computed when it was captured — total " +
 			"lines, the line delta vs the previous version (delta_lines, e.g. \"+21\"/\"-21\"), " +
 			"and the first non-empty lines (signature) — so you can tell which version contains " +
-			"a given function or block WITHOUT calling lochis_get_version. " +
+			"a given function or block WITHOUT calling salvager_get_version. " +
 			"The oldest version is labeled \"first-seen\": it already holds the work captured when " +
-			"lochis first saw the file — it is NOT an empty baseline, so inspect it like any other. " +
+			"salvager first saw the file — it is NOT an empty baseline, so inspect it like any other. " +
 			"Before concluding that something was never added or no longer exists, use the signal " +
 			"(especially delta_lines and signature) to find the version that has it; a large positive " +
 			"delta marks where lines were added and a negative delta where they were removed.",
@@ -117,7 +117,7 @@ func NewServer(b Backend) *mcp.Server {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "lochis_get_version",
+		Name:        "salvager_get_version",
 		Description: "Return the content of a specific recorded version, so it can be inspected before acting.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in getInput) (*mcp.CallToolResult, getOutput, error) {
 		content, err := b.Get(in.File, in.Timestamp)
@@ -128,7 +128,7 @@ func NewServer(b Backend) *mcp.Server {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "lochis_restore",
+		Name:        "salvager_restore",
 		Description: "Restore a file to a recorded version. The current state is saved first (pre-restore), so this is reversible.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in restoreInput) (*mcp.CallToolResult, restoreOutput, error) {
 		preTs, err := b.Restore(in.File, in.Timestamp)

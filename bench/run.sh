@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# lochis lightness benchmark — reproducible "proof of lightness" harness.
+# salvager lightness benchmark — reproducible "proof of lightness" harness.
 #
-# Measures four operator-facing properties of `lochis watch` on a synthetic
+# Measures four operator-facing properties of `salvager watch` on a synthetic
 # large repo, then writes a publishable Markdown table to bench/RESULTS.md:
 #
 #   1. Initial capture   wall time to record the first revision of every file
-#                        (cold .lochis), plus files/s and MB/s.
+#                        (cold .salvager), plus files/s and MB/s.
 #   2. Watches consumed  real kernel resources held while idle: inotify watch
 #                        descriptors (Linux) or open kqueue dir fds (macOS),
 #                        plus resident memory (RSS).
@@ -27,7 +27,7 @@
 #   PROFILE=large bench/run.sh   # stress (100k / 10k)
 #   WINDOW=120 bench/run.sh      # longer CPU-at-rest window (seconds)
 #
-# Env knobs: PROFILE WINDOW LAT_SAMPLES SEED LOCHIS_BIN TREE OUT
+# Env knobs: PROFILE WINDOW LAT_SAMPLES SEED SALVAGER_BIN TREE OUT
 set -euo pipefail
 
 # --------------------------------------------------------------------------
@@ -40,12 +40,12 @@ PROFILE="${PROFILE:-default}"
 WINDOW="${WINDOW:-60}"                 # CPU-at-rest sampling window, seconds
 LAT_SAMPLES="${LAT_SAMPLES:-30}"       # save->queryable latency samples
 SEED="${SEED:-1337}"
-LOCHIS_BIN="${LOCHIS_BIN:-$REPO/lochis}"
-TREE="${TREE:-${TMPDIR:-/tmp}/lochis-bench-tree}"
+SALVAGER_BIN="${SALVAGER_BIN:-$REPO/salvager}"
+TREE="${TREE:-${TMPDIR:-/tmp}/salvager-bench-tree}"
 TREE="$(python3 -c 'import os,sys;print(os.path.normpath(sys.argv[1]))' "$TREE")"
 OUT="${OUT:-$HERE/RESULTS.md}"
 # Watcher stderr goes OUTSIDE the watched tree, else the watcher records it.
-WERR="${TMPDIR:-/tmp}/lochis-bench-watch.err"
+WERR="${TMPDIR:-/tmp}/salvager-bench-watch.err"
 
 case "$PROFILE" in
   small)   DEF_FILES=2000;   DEF_DIRS=200;;
@@ -82,16 +82,16 @@ cpu_seconds() { ps -o time= -p "$1" 2>/dev/null | awk -F: '{s=0;for(i=1;i<=NF;i+
 # Resident set size in MB.
 rss_mb() { ps -o rss= -p "$1" 2>/dev/null | awk '{printf "%.1f", $1/1024}' || true; }
 
-# Number of recorded logs. Tolerant of the startup race where .lochis/index
+# Number of recorded logs. Tolerant of the startup race where .salvager/index
 # does not exist yet (find then exits non-zero under pipefail).
 log_count() {
   local n
-  n="$(find "$TREE/.lochis/index" -type f -name '*.log' 2>/dev/null | wc -l | tr -d ' ')" || true
+  n="$(find "$TREE/.salvager/index" -type f -name '*.log' 2>/dev/null | wc -l | tr -d ' ')" || true
   echo "${n:-0}"
 }
 
 start_watcher() {
-  ( cd "$TREE" && exec "$LOCHIS_BIN" watch ) >/dev/null 2>"$WERR" &
+  ( cd "$TREE" && exec "$SALVAGER_BIN" watch ) >/dev/null 2>"$WERR" &
   WPID=$!
 }
 
@@ -148,7 +148,7 @@ PY
 # 1. Initial capture (cold)
 # --------------------------------------------------------------------------
 measure_capture() {
-  rm -rf "$TREE/.lochis"
+  rm -rf "$TREE/.salvager"
   say "[capture] cold start, waiting for $FILES logs ..."
   local t0 t1 c last stable=0 poll=0.1
   [ "$FILES" -gt 50000 ] && poll=0.5   # find over 100k+ logs is itself costly
@@ -197,12 +197,12 @@ measure_watches() {
   else
     # kqueue: one open fd per watched PATH — every file AND directory — so the
     # footprint scales with file count and is bounded by `ulimit -n`. Count
-    # REG+DIR fds under the tree, excluding the .lochis store's own files.
+    # REG+DIR fds under the tree, excluding the .salvager store's own files.
     WATCH_KIND="open kqueue fds"
     WATCH_NOTE="kqueue holds ~1 fd per watched path (file + dir); tree = $FILES files / $DIRS dirs"
     EXP_PATHS=$((FILES + DIRS))
     WATCHES="$( { lsof -p "$WPID" 2>/dev/null \
-               | awk -v t="$rp/" '($5=="REG"||$5=="DIR") && index($NF,t)==1 && $NF !~ /\/\.lochis(\/|$)/' \
+               | awk -v t="$rp/" '($5=="REG"||$5=="DIR") && index($NF,t)==1 && $NF !~ /\/\.salvager(\/|$)/' \
                | wc -l | tr -d ' '; } || echo 0)"
   fi
   WATCH_RSS="$(rss_mb "$WPID")"
@@ -241,7 +241,7 @@ measure_cpu_idle() {
 # --------------------------------------------------------------------------
 measure_latency() {
   local probe="$TREE/d0000/lat_probe.txt"
-  local plog="$TREE/.lochis/index/d0000/lat_probe.txt.log"
+  local plog="$TREE/.salvager/index/d0000/lat_probe.txt.log"
   mkdir -p "$(dirname "$probe")"
   printf 'seed\n' > "$probe"
   # Wait for the initial revision so the .log exists before we sample modifies.
@@ -315,7 +315,7 @@ write_report() {
   go_ver="$(go version 2>/dev/null | awk '{print $3}')"
 
   cat > "$OUT" <<EOF
-# lochis v1 — lightness benchmark
+# salvager v1 — lightness benchmark
 
 Reproduce: \`PROFILE=$PROFILE bench/run.sh\`. Method and caveats: \`bench/PROTOCOL.md\`.
 
@@ -347,7 +347,7 @@ EOF
 
 # --------------------------------------------------------------------------
 main() {
-  [ -x "$LOCHIS_BIN" ] || { say "build first: (cd $REPO && go build -o lochis .)"; exit 1; }
+  [ -x "$SALVAGER_BIN" ] || { say "build first: (cd $REPO && go build -o salvager .)"; exit 1; }
   gen_tree
   measure_capture
   measure_watches

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"lochis/ignore"
-	"lochis/store"
+	"github.com/usesalvager/salvager/ignore"
+	"github.com/usesalvager/salvager/store"
 )
 
 // waitFor polls cond until true or the deadline passes.

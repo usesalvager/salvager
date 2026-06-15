@@ -1,4 +1,4 @@
-module lochis
+module github.com/usesalvager/salvager
 
 go 1.25.0
 

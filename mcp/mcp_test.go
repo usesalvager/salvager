@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"lochis/store"
+	"github.com/usesalvager/salvager/store"
 )
 
 // --- test helpers (uniquely prefixed to avoid collisions in package mcp) ---
@@ -71,14 +71,14 @@ func mcpResultJSON(t *testing.T, res *mcp.CallToolResult) []byte {
 }
 
 // mcp seed: a real FS store under tmp, recording revisions through the store so
-// the MCP server reads the very same .lochis/ (A8.4).
+// the MCP server reads the very same .salvager/ (A8.4).
 func mcpSeedStore(t *testing.T) (*store.FS, string) {
 	t.Helper()
 	root := t.TempDir()
 	return store.New(root), root
 }
 
-// A8.1 — lochis_list_versions returns revisions newest-first, each with raw
+// A8.1 — salvager_list_versions returns revisions newest-first, each with raw
 // timestamp, timestamp_human, hash_short and label.
 func TestMCP_ListVersions(t *testing.T) {
 	ctx := context.Background()
@@ -99,7 +99,7 @@ func TestMCP_ListVersions(t *testing.T) {
 
 	cs := mcpClientFor(t, s)
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_list_versions",
+		Name:      "salvager_list_versions",
 		Arguments: map[string]any{"file": "a.txt"},
 	})
 	if err != nil {
@@ -169,7 +169,7 @@ func TestMCP_ListVersions(t *testing.T) {
 // in the original trace saw only timestamps + labels, inspected only the broken
 // revision, and wrongly concluded the function "was never added". list_versions
 // must now let an agent tell which revision holds the work — the line delta and
-// signature — WITHOUT calling lochis_get_version on a single revision.
+// signature — WITHOUT calling salvager_get_version on a single revision.
 func TestMCP_ListVersions_Signal_DistinguishesByDelta(t *testing.T) {
 	ctx := context.Background()
 	s, root := mcpSeedStore(t)
@@ -199,7 +199,7 @@ func TestMCP_ListVersions_Signal_DistinguishesByDelta(t *testing.T) {
 
 	cs := mcpClientFor(t, s)
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_list_versions",
+		Name:      "salvager_list_versions",
 		Arguments: map[string]any{"file": "stats.py"},
 	})
 	if err != nil {
@@ -274,7 +274,7 @@ func TestMCP_ListVersions_LegacyRevisionHasNoSignal(t *testing.T) {
 
 	cs := mcpClientFor(t, s)
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_list_versions",
+		Name:      "salvager_list_versions",
 		Arguments: map[string]any{"file": "old.txt"},
 	})
 	if err != nil {
@@ -300,7 +300,7 @@ func TestMCP_ListVersions_LegacyRevisionHasNoSignal(t *testing.T) {
 	}
 }
 
-// A8.2 — lochis_get_version returns exactly the content for that revision.
+// A8.2 — salvager_get_version returns exactly the content for that revision.
 func TestMCP_GetVersion(t *testing.T) {
 	ctx := context.Background()
 	s, root := mcpSeedStore(t)
@@ -319,7 +319,7 @@ func TestMCP_GetVersion(t *testing.T) {
 
 	cs := mcpClientFor(t, s)
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_get_version",
+		Name:      "salvager_get_version",
 		Arguments: map[string]any{"file": "a.txt", "timestamp": xTs},
 	})
 	if err != nil {
@@ -338,7 +338,7 @@ func TestMCP_GetVersion(t *testing.T) {
 	}
 }
 
-// A8.3 — lochis_restore restores the on-disk file AND reports a non-zero
+// A8.3 — salvager_restore restores the on-disk file AND reports a non-zero
 // pre_restore_timestamp that can undo. Verify the undo round-trips.
 func TestMCP_Restore_ReportsPreRestoreAndIsReversible(t *testing.T) {
 	ctx := context.Background()
@@ -363,7 +363,7 @@ func TestMCP_Restore_ReportsPreRestoreAndIsReversible(t *testing.T) {
 
 	// Restore to the good revision.
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_restore",
+		Name:      "salvager_restore",
 		Arguments: map[string]any{"file": "a.txt", "timestamp": goodTs},
 	})
 	if err != nil {
@@ -395,7 +395,7 @@ func TestMCP_Restore_ReportsPreRestoreAndIsReversible(t *testing.T) {
 
 	// Undo: a second restore to pre_restore_timestamp brings back the broken state.
 	res2, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_restore",
+		Name:      "salvager_restore",
 		Arguments: map[string]any{"file": "a.txt", "timestamp": out.PreRestoreTimestamp},
 	})
 	if err != nil {
@@ -452,7 +452,7 @@ func seedMedianBaseline(t *testing.T, s *store.FS, root string) (firstSeenTs int
 	return revs[len(revs)-1].Timestamp
 }
 
-// Recovering lost work through lochis_restore leaves the safe-path trace in
+// Recovering lost work through salvager_restore leaves the safe-path trace in
 // history: a pre-restore revision followed by a restore revision, NOT a generic
 // modify. The restore tool stays valid after reverting the inspect/restore
 // separation, and anyone (human or agent) who uses it must still get the
@@ -465,7 +465,7 @@ func TestMCP_Restore_LeavesPreRestoreThenRestoreTrace(t *testing.T) {
 
 	cs := mcpClientFor(t, s)
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_restore",
+		Name:      "salvager_restore",
 		Arguments: map[string]any{"file": "stats.py", "timestamp": firstSeenTs},
 	})
 	if err != nil {
@@ -499,7 +499,7 @@ func TestMCP_Restore_LeavesPreRestoreThenRestoreTrace(t *testing.T) {
 }
 
 // A8.4 — revisions written via store.Record are visible through the MCP backend
-// (same .lochis/). Asserted explicitly: write via store, read via MCP tool, and
+// (same .salvager/). Asserted explicitly: write via store, read via MCP tool, and
 // confirm the revision count/timestamps match what the store reports.
 func TestMCP_SharedStore_StoreWritesVisibleViaMCP(t *testing.T) {
 	ctx := context.Background()
@@ -512,14 +512,14 @@ func TestMCP_SharedStore_StoreWritesVisibleViaMCP(t *testing.T) {
 		}
 	}
 
-	// Confirm it really lives under root/.lochis/ (the shared store dir).
+	// Confirm it really lives under root/.salvager/ (the shared store dir).
 	if _, err := os.Stat(filepath.Join(root, store.Dir, "index", "shared.txt.log")); err != nil {
 		t.Fatalf("expected shared store log on disk: %v", err)
 	}
 
 	cs := mcpClientFor(t, s)
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_list_versions",
+		Name:      "salvager_list_versions",
 		Arguments: map[string]any{"file": "shared.txt"},
 	})
 	if err != nil {
@@ -547,7 +547,7 @@ func TestMCP_SharedStore_StoreWritesVisibleViaMCP(t *testing.T) {
 
 	// And the newest content read via MCP equals the latest store write.
 	getRes, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_get_version",
+		Name:      "salvager_get_version",
 		Arguments: map[string]any{"file": "shared.txt", "timestamp": out.Versions[0].Timestamp},
 	})
 	if err != nil {
@@ -586,7 +586,7 @@ func TestMCP_ExactlyThreeReadOrRestoreTools(t *testing.T) {
 	for _, tool := range lt.Tools {
 		got[tool.Name] = true
 	}
-	want := []string{"lochis_list_versions", "lochis_get_version", "lochis_restore"}
+	want := []string{"salvager_list_versions", "salvager_get_version", "salvager_restore"}
 	for _, w := range want {
 		if !got[w] {
 			t.Errorf("missing expected tool %q (have %v)", w, keysOf(got))
@@ -613,7 +613,7 @@ func keysOf(m map[string]bool) []string {
 	return out
 }
 
-// A8.6 — lochis_get_version with a non-existent timestamp surfaces a clear,
+// A8.6 — salvager_get_version with a non-existent timestamp surfaces a clear,
 // structured error (IsError result), not a panic and not an ambiguous empty
 // success.
 func TestMCP_GetVersion_NonexistentTimestamp_ClearError(t *testing.T) {
@@ -627,7 +627,7 @@ func TestMCP_GetVersion_NonexistentTimestamp_ClearError(t *testing.T) {
 
 	cs := mcpClientFor(t, s)
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "lochis_get_version",
+		Name:      "salvager_get_version",
 		Arguments: map[string]any{"file": "a.txt", "timestamp": int64(999999999999)},
 	})
 	// A tool-level error is reported as IsError on the result, not as a

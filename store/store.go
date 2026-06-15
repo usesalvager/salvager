@@ -1,8 +1,8 @@
-// Package store holds the per-file revision history under .lochis/.
+// Package store holds the per-file revision history under .salvager/.
 //
 // Layout on disk:
 //
-//	.lochis/
+//	.salvager/
 //	├── objects/<sha256>        full content, deduplicated by hash
 //	└── index/<relpath>.log     one line per revision of that file
 //
@@ -39,15 +39,15 @@ import (
 )
 
 // Dir is the name of the history directory created inside a project root.
-const Dir = ".lochis"
+const Dir = ".salvager"
 
 // Label classifies why a revision was recorded.
 type Label string
 
 const (
-	// LabelInitial marks the first revision lochis recorded for a file. Its
+	// LabelInitial marks the first revision salvager recorded for a file. Its
 	// value is "first-seen", not "initial", on purpose: this revision already
-	// holds the content captured the moment lochis first saw the file — it is
+	// holds the content captured the moment salvager first saw the file — it is
 	// NOT an empty starting point, and an agent must inspect it like any other.
 	LabelInitial    Label = "first-seen"
 	LabelModify     Label = "modify"
@@ -108,13 +108,13 @@ type FS struct {
 	mu   sync.Mutex // serializes all writes for the v1 (simple first)
 }
 
-// New returns a Store rooted at root. The .lochis/ directory is created lazily.
+// New returns a Store rooted at root. The .salvager/ directory is created lazily.
 func New(root string) *FS {
 	return &FS{root: root}
 }
 
-// Init eagerly creates the .lochis/ skeleton (objects/ and index/). The watcher
-// calls this on startup so `lochis watch` materializes the history directory
+// Init eagerly creates the .salvager/ skeleton (objects/ and index/). The watcher
+// calls this on startup so `salvager watch` materializes the history directory
 // immediately, even in an empty project before the first change. Read-only
 // entry points (history/show) still create nothing.
 func (s *FS) Init() error {
@@ -509,7 +509,7 @@ func (s *FS) Restore(relPath string, ts int64) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return 0, err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(abs), ".lochis-restore-*")
+	tmp, err := os.CreateTemp(filepath.Dir(abs), ".salvager-restore-*")
 	if err != nil {
 		return 0, err
 	}

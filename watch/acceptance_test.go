@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"lochis/ignore"
-	"lochis/store"
+	"github.com/usesalvager/salvager/ignore"
+	"github.com/usesalvager/salvager/store"
 )
 
 // acceptStart wires up a real store + ignore matcher and starts the watcher in
@@ -323,7 +323,7 @@ func TestAcceptA5_1GitignoreRespected(t *testing.T) {
 	}
 }
 
-// A5.3 — the watcher never records anything under .lochis/ (no auto-capture
+// A5.3 — the watcher never records anything under .salvager/ (no auto-capture
 // feedback loop). This is critical.
 func TestAcceptA5_3NoSelfCaptureLoop(t *testing.T) {
 	root := t.TempDir()
@@ -338,24 +338,24 @@ func TestAcceptA5_3NoSelfCaptureLoop(t *testing.T) {
 		t.Fatal("initial revision never recorded")
 	}
 
-	// Generate normal activity so the store writes into .lochis/ repeatedly.
+	// Generate normal activity so the store writes into .salvager/ repeatedly.
 	for i, v := range []string{"v1", "v2", "v3", "v4", "v5"} {
 		if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte(v), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		_ = i
-		time.Sleep(120 * time.Millisecond) // separated > debounce so each flushes a write to .lochis/
+		time.Sleep(120 * time.Millisecond) // separated > debounce so each flushes a write to .salvager/
 	}
 	// Let everything settle, including any spurious feedback events.
 	time.Sleep(500 * time.Millisecond)
 
-	// 1. A specific known .lochis path must have no history.
+	// 1. A specific known .salvager path must have no history.
 	selfPath := filepath.Join(store.Dir, "index", "a.txt.log")
 	if n := acceptRevCount(t, s, selfPath); n != 0 {
 		t.Errorf("watcher recorded its own log file (%s): %d revisions", selfPath, n)
 	}
 
-	// 2. Direct check: no .log exists whose relpath starts with ".lochis".
+	// 2. Direct check: no .log exists whose relpath starts with ".salvager".
 	var offending []string
 	_ = filepath.Walk(filepath.Join(root, store.Dir, "index"), func(p string, fi os.FileInfo, err error) error {
 		if err != nil || fi.IsDir() {

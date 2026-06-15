@@ -3,16 +3,16 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.lochis.watch.lochis-ai</string>
+    <string>com.salvager.watch</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/gorka/go/bin/lochis</string>
+        <string>/Users/you/go/bin/salvager</string>
         <string>watch</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/gorka/sites/somhi-lagunak/sites/lochis.ai</string>
+    <string>/path/to/your/project</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -21,9 +21,9 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/gorka/Library/Logs/lochis-lochis-ai.out.log</string>
+    <string>/Users/you/Library/Logs/salvager.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/gorka/Library/Logs/lochis-lochis-ai.err.log</string>
+    <string>/Users/you/Library/Logs/salvager.err.log</string>
 </dict>
 </plist>

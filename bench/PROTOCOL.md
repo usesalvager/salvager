@@ -1,6 +1,6 @@
-# lochis lightness benchmark — protocol
+# salvager lightness benchmark — protocol
 
-A reproducible way to measure what makes `lochis watch` cheap to leave running,
+A reproducible way to measure what makes `salvager watch` cheap to leave running,
 and to publish the numbers honestly. Nothing here patches the watcher: every
 metric is observed from the outside, the way an operator would see it.
 
@@ -15,7 +15,7 @@ metric is observed from the outside, the way an operator would see it.
 
 ## How each is measured
 
-**1. Initial capture.** Delete `.lochis/`, start `lochis watch`, and poll the
+**1. Initial capture.** Delete `.salvager/`, start `salvager watch`, and poll the
 number of `index/**/*.log` files until it reaches the file count (or plateaus).
 The clock starts *before* the process spawns, so the figure includes process
 start — it is time-to-first-protection, not just scan time. Reported with
@@ -57,7 +57,7 @@ identical, nothing written).
 ## Running it
 
 ```sh
-(cd .. && go build -o lochis .)   # build the binary the harness exercises
+(cd .. && go build -o salvager .)   # build the binary the harness exercises
 PROFILE=small bench/run.sh        # 2k files / 200 dirs — quick smoke (~seconds)
 bench/run.sh                      # default: 20k / 2k
 PROFILE=large bench/run.sh        # 100k / 10k — stress
@@ -69,7 +69,7 @@ WINDOW=120 LAT_SAMPLES=50 bench/run.sh
 Output: `bench/RESULTS.md`, a self-contained table stamped with date, commit,
 host, CPU, Go version, and profile.
 
-Env knobs: `PROFILE` `WINDOW` `LAT_SAMPLES` `SEED` `LOCHIS_BIN` `TREE` `OUT`
+Env knobs: `PROFILE` `WINDOW` `LAT_SAMPLES` `SEED` `SALVAGER_BIN` `TREE` `OUT`
 plus `FILES`/`DIRS` overrides (with `PROFILE=custom`).
 
 ## Scaling sweep & the watch ceiling
@@ -110,7 +110,7 @@ Linux (inotify). So:
   so file count barely matters — a 200k-file tree in 20k dirs needs only ~20k
   watches. Raise it with `sudo sysctl -w fs.inotify.max_user_watches=<N>`.
 
-This asymmetry is the honest scaling story: lochis is featherweight on CPU and
+This asymmetry is the honest scaling story: salvager is featherweight on CPU and
 memory at any size, but live-watch *coverage* on macOS is fd-bound, and the
 sweep shows exactly where.
 
@@ -128,7 +128,7 @@ sweep shows exactly where.
   macOS kqueue ≈ one fd per *path*. Don't quote a macOS fd count as if it were
   a Linux watch count. The harness labels which it measured.
 - **Capture must be cold.** A warm re-run finds objects already present and
-  skips the writes, which understates the work. The harness deletes `.lochis/`
+  skips the writes, which understates the work. The harness deletes `.salvager/`
   first; keep it that way.
 - **Polling resolution is the error bar.** Capture is polled at 100 ms and
   latency at 10 ms, so treat those as the resolution of each figure. Run a few
@@ -138,7 +138,7 @@ sweep shows exactly where.
 
 ## What not to claim
 
-Don't generalize one host's numbers to "lochis uses X% CPU" without the host
+Don't generalize one host's numbers to "salvager uses X% CPU" without the host
 and profile. Don't compare against another tool unless it watched the *same*
 tree on the *same* machine in the same run. The defensible claim is narrow and
 strong: *on this tree, the watcher holds N watches, burns P% of a core idle,

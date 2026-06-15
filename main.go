@@ -1,11 +1,11 @@
-// Command lochis is a filesystem-level local-history safety net for agents.
+// Command salvager is a filesystem-level local-history safety net for agents.
 //
-//	lochis watch                    start the watcher (runs until killed)
-//	lochis history <file>           list recorded versions of a file
-//	lochis show <file> <ts>         print the content of one version
-//	lochis restore <file> <ts>      restore a file to a version (reversible)
-//	lochis mcp                      start the MCP server (stdio)
-//	lochis gc [--max-age 7d]        purge revisions older than the threshold
+//	salvager watch                    start the watcher (runs until killed)
+//	salvager history <file>           list recorded versions of a file
+//	salvager show <file> <ts>         print the content of one version
+//	salvager restore <file> <ts>      restore a file to a version (reversible)
+//	salvager mcp                      start the MCP server (stdio)
+//	salvager gc [--max-age 7d]        purge revisions older than the threshold
 package main
 
 import (
@@ -22,21 +22,21 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"lochis/ignore"
-	"lochis/mcp"
-	"lochis/store"
-	"lochis/watch"
+	"github.com/usesalvager/salvager/ignore"
+	"github.com/usesalvager/salvager/mcp"
+	"github.com/usesalvager/salvager/store"
+	"github.com/usesalvager/salvager/watch"
 )
 
-const usage = `lochis — local history for agents
+const usage = `salvager — local history for agents
 
 Usage:
-  lochis watch [--allow-partial]  start the watcher (runs until killed)
-  lochis history <file>           list recorded versions of a file
-  lochis show <file> <timestamp>  print the content of one version
-  lochis restore <file> <ts>      restore a file to a version (reversible)
-  lochis mcp                      start the MCP server (stdio)
-  lochis gc [--max-age 7d]        purge revisions older than the threshold
+  salvager watch [--allow-partial]  start the watcher (runs until killed)
+  salvager history <file>           list recorded versions of a file
+  salvager show <file> <timestamp>  print the content of one version
+  salvager restore <file> <ts>      restore a file to a version (reversible)
+  salvager mcp                      start the MCP server (stdio)
+  salvager gc [--max-age 7d]        purge revisions older than the threshold
 `
 
 func main() {
@@ -67,7 +67,7 @@ func main() {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
-		fmt.Fprintf(os.Stderr, "lochis: unknown command %q\n\n%s", os.Args[1], usage)
+		fmt.Fprintf(os.Stderr, "salvager: unknown command %q\n\n%s", os.Args[1], usage)
 		os.Exit(2)
 	}
 }
@@ -79,7 +79,7 @@ func cmdWatch(root string, args []string) {
 		case "--allow-partial":
 			allowPartial = true
 		default:
-			fatalf("usage: lochis watch [--allow-partial]")
+			fatalf("usage: salvager watch [--allow-partial]")
 		}
 	}
 
@@ -102,7 +102,7 @@ func cmdWatch(root string, args []string) {
 		close(done)
 	}()
 
-	fmt.Fprintf(os.Stderr, "lochis: watching %s (Ctrl-C to stop)\n", root)
+	fmt.Fprintf(os.Stderr, "salvager: watching %s (Ctrl-C to stop)\n", root)
 	if err := w.Run(done); err != nil {
 		fatal(err)
 	}
@@ -110,7 +110,7 @@ func cmdWatch(root string, args []string) {
 
 func cmdHistory(root string, args []string) {
 	if len(args) != 1 {
-		fatalf("usage: lochis history <file>")
+		fatalf("usage: salvager history <file>")
 	}
 	s := store.New(root)
 	revs, err := s.List(rel(root, args[0]))
@@ -135,7 +135,7 @@ func cmdHistory(root string, args []string) {
 			shortHash(r.Hash), r.Label, lines, delta, start)
 	}
 	tw.Flush()
-	fmt.Fprintln(os.Stderr, "\nrestore with: lochis restore", args[0], "<timestamp-ms>")
+	fmt.Fprintln(os.Stderr, "\nrestore with: salvager restore", args[0], "<timestamp-ms>")
 	fmt.Fprintln(os.Stderr, "(timestamps below are human-readable; raw ms:)")
 	for _, r := range revs {
 		fmt.Fprintf(os.Stderr, "  %d  %s\n", r.Timestamp, r.Label)
@@ -144,7 +144,7 @@ func cmdHistory(root string, args []string) {
 
 func cmdShow(root string, args []string) {
 	if len(args) != 2 {
-		fatalf("usage: lochis show <file> <timestamp>")
+		fatalf("usage: salvager show <file> <timestamp>")
 	}
 	ts := parseTS(args[1])
 	s := store.New(root)
@@ -157,7 +157,7 @@ func cmdShow(root string, args []string) {
 
 func cmdRestore(root string, args []string) {
 	if len(args) != 2 {
-		fatalf("usage: lochis restore <file> <timestamp>")
+		fatalf("usage: salvager restore <file> <timestamp>")
 	}
 	ts := parseTS(args[1])
 	s := store.New(root)
@@ -166,7 +166,7 @@ func cmdRestore(root string, args []string) {
 		fatal(err)
 	}
 	fmt.Printf("restored %s to revision %d\n", args[0], ts)
-	fmt.Printf("previous state saved as pre-restore revision %d (undo with: lochis restore %s %d)\n",
+	fmt.Printf("previous state saved as pre-restore revision %d (undo with: salvager restore %s %d)\n",
 		preTs, args[0], preTs)
 }
 
@@ -196,7 +196,7 @@ func cmdGC(root string, args []string) {
 			maxAge = d
 			i++
 		} else {
-			fatalf("usage: lochis gc [--max-age 7d]")
+			fatalf("usage: salvager gc [--max-age 7d]")
 		}
 	}
 	s := store.New(root)
@@ -233,7 +233,7 @@ func parseMaxAge(s string) (time.Duration, error) {
 func parseTS(s string) int64 {
 	ts, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		fatalf("invalid timestamp %q (use the raw ms value from `lochis history`)", s)
+		fatalf("invalid timestamp %q (use the raw ms value from `salvager history`)", s)
 	}
 	return ts
 }
@@ -257,5 +257,5 @@ func firstLine(sig string) string {
 	return sig
 }
 
-func fatal(err error)           { fmt.Fprintln(os.Stderr, "lochis:", err); os.Exit(1) }
-func fatalf(f string, a ...any) { fmt.Fprintf(os.Stderr, "lochis: "+f+"\n", a...); os.Exit(1) }
+func fatal(err error)           { fmt.Fprintln(os.Stderr, "salvager:", err); os.Exit(1) }
+func fatalf(f string, a ...any) { fmt.Fprintf(os.Stderr, "salvager: "+f+"\n", a...); os.Exit(1) }

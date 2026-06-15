@@ -1,4 +1,6 @@
-# `lochis` — Local History for agents
+# `salvager` — Local History for agents
+
+> Home: **[salvager.sh](https://salvager.sh)**
 
 A filesystem-level code safety net. A passive watcher saves **per-file**
 revisions automatically; when an agent (or a human) breaks something, you
@@ -8,7 +10,7 @@ MCP, so it can self-repair.
 ## Build
 
 ```sh
-go build -o lochis .
+go build -o salvager .
 ```
 
 Single static binary, no runtime. macOS and Linux supported; Windows best-effort.
@@ -16,15 +18,15 @@ Single static binary, no runtime. macOS and Linux supported; Windows best-effort
 ## Usage
 
 ```
-lochis watch [--allow-partial]  start the watcher (runs until killed)
-lochis history <file>           list recorded versions of a file
-lochis show <file> <ts>         print the content of one version
-lochis restore <file> <ts>      restore a file to a version (reversible)
-lochis mcp                      start the MCP server (stdio)
-lochis gc [--max-age 7d]        purge revisions older than the threshold
+salvager watch [--allow-partial]  start the watcher (runs until killed)
+salvager history <file>           list recorded versions of a file
+salvager show <file> <ts>         print the content of one version
+salvager restore <file> <ts>      restore a file to a version (reversible)
+salvager mcp                      start the MCP server (stdio)
+salvager gc [--max-age 7d]        purge revisions older than the threshold
 ```
 
-Run `lochis watch` in the root of any project — zero configuration. It records
+Run `salvager watch` in the root of any project — zero configuration. It records
 an initial revision of every tracked file on startup, then captures every
 change (debounced ~300 ms) thereafter.
 
@@ -37,7 +39,7 @@ enough to exhaust that ceiling — ~200k files hits the macOS default — would
 otherwise leave the overflow directories unwatched: their files get an initial
 snapshot and then **silently freeze**, never recording another edit.
 
-Lochis closes that gap automatically. Any directory the kernel refuses to watch
+Salvager closes that gap automatically. Any directory the kernel refuses to watch
 in real time is handed to a **polling sweep** instead: a periodic
 stat-based (mtime+size) reconciliation that re-enumerates the overflow subtree,
 captures new files and edits, and lets content-hash dedup absorb the rest.
@@ -47,7 +49,7 @@ near-zero disk I/O when idle (pure metadata) and backs off with the work it
 finds, so it stays light even on a 200k-file tree.
 
 `--allow-partial` is the one escape hatch. If polling is ever unavailable to
-cover a real-time shortfall, Lochis **refuses to start** rather than run with
+cover a real-time shortfall, Salvager **refuses to start** rather than run with
 silent gaps — unless you pass `--allow-partial`, which means "I knowingly run
 without full coverage." Partial coverage is only ever reachable by that explicit
 choice; it is never the default and never silent.
@@ -61,19 +63,19 @@ Timestamps printed by `history` are human-readable; the raw millisecond values
 on-disk state as a `pre-restore` revision, so any restore is itself reversible.
 
 ```
-lochis history config.json          # find the good version
-lochis show config.json 1718312445  # inspect it
-lochis restore config.json 1718312445
+salvager history config.json          # find the good version
+salvager show config.json 1718312445  # inspect it
+salvager restore config.json 1718312445
 # → prints the pre-restore timestamp to undo if needed
 ```
 
 ## MCP
 
-`lochis mcp` exposes exactly three tools over stdio:
+`salvager mcp` exposes exactly three tools over stdio:
 
-- `lochis_list_versions` — list a file's versions (read-only)
-- `lochis_get_version` — read one version's content (inspect before acting)
-- `lochis_restore` — restore a version (returns the pre-restore timestamp)
+- `salvager_list_versions` — list a file's versions (read-only)
+- `salvager_get_version` — read one version's content (inspect before acting)
+- `salvager_restore` — restore a version (returns the pre-restore timestamp)
 
 No purge or delete is exposed over MCP — the safety net can't be erased by the
 agent that might break things.
@@ -83,17 +85,17 @@ Register it with an MCP client (e.g. Claude Code):
 ```json
 {
   "mcpServers": {
-    "lochis": { "command": "lochis", "args": ["mcp"], "cwd": "/path/to/project" }
+    "salvager": { "command": "salvager", "args": ["mcp"], "cwd": "/path/to/project" }
   }
 }
 ```
 
-## Data layout (`.lochis/`)
+## Data layout (`.salvager/`)
 
 Readable without the tool — `ls` and `cat` recover anything by hand:
 
 ```
-.lochis/
+.salvager/
 ├── objects/<sha256>          full content, deduplicated by hash
 └── index/<relpath>.log       one line per revision (tab-separated):
                               <unix_ms>\t<sha256>\t<label>\t<lines>\t<bytes>\t<delta>\t<start-signature>
@@ -113,7 +115,7 @@ an empty baseline.)
 
 ## What's ignored
 
-The project's `.gitignore` plus always-on defaults: `.git`, `.lochis`,
+The project's `.gitignore` plus always-on defaults: `.git`, `.salvager`,
 `node_modules`, `vendor`, `.venv`, `__pycache__`, `target`, `dist`, `build`.
 
 Transient editor artifacts are ignored too — swap, autosave, lock and backup
@@ -128,11 +130,11 @@ versioned under its own real path, so nothing is lost.
 
 Renaming a file is recorded as a delete of the old path plus a fresh history at
 the new path — history is **not** transferred to the new path, but it stays
-fully recoverable under the old one (`lochis history old.txt` / `restore`).
+fully recoverable under the old one (`salvager history old.txt` / `restore`).
 
 ## Retention
 
-`lochis gc` drops revisions older than N days (default 7) and garbage-collects
+`salvager gc` drops revisions older than N days (default 7) and garbage-collects
 any object no longer referenced by any log. Run it manually or once a day.
 
 ## Performance (measured)
@@ -144,7 +146,7 @@ operator would see it (process CPU time, kernel watch/fd counts, save→queryabl
 latency). Method and honesty conditions: `bench/PROTOCOL.md`.
 
 ```sh
-(cd .. && go build -o lochis .)   # build the binary the harness exercises
+(cd .. && go build -o salvager .)   # build the binary the harness exercises
 bench/run.sh                      # one tree → bench/RESULTS.md
 bench/sweep.sh                    # 20k / 100k / 200k → bench/SCALING.md
 go test ./store -bench=. -benchmem -run=^$   # store per-revision cost, no fs events

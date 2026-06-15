@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"lochis/ignore"
+	"github.com/usesalvager/salvager/ignore"
 )
 
 // The sweep engine is the portable coverage guarantee. When the real-time
@@ -31,7 +31,7 @@ import (
 // coarse-timestamp filesystems documented on fileState.
 //
 // I/O cost of a sweep (measured — Apple M2 Pro, APFS, go1.25, 88,000 files
-// across 8,800 directories; reproduce with `LOCHIS_SWEEP_BENCH=1 go test
+// across 8,800 directories; reproduce with `SALVAGER_SWEEP_BENCH=1 go test
 // ./watch -run TestSweepIOCost -v`, which prints the live counters):
 //
 //	                 wall     dir reads   file stats   content reads   bytes read
@@ -100,7 +100,7 @@ type sweeper struct {
 // coarse-granularity filesystem (≥1s resolution — notably some NFS mounts, e.g.
 // NFSv3; also FAT), two same-size in-place writes within one tick can collide on
 // both mtime and ctime and be missed until the next stat-moving change. NFS
-// attribute caching adds a visibility lag on top, though lochis normally runs on
+// attribute caching adds a visibility lag on top, though salvager normally runs on
 // the same host as the writer, where close-to-open consistency makes the client
 // observe its own writes (cross-host NFS sharing is the corner). This only bites
 // in overflow/polling mode and self-heals on the next stat-moving change; local

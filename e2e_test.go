@@ -1,16 +1,16 @@
 package main
 
-// End-to-end / CLI tests. These build the real `lochis` binary and exercise
+// End-to-end / CLI tests. These build the real `salvager` binary and exercise
 // its subcommands as a user (and an agent) would: through exec.Command in a
 // throwaway project directory, with the watcher running as a real subprocess.
 //
 // Cases covered (TESTS-v1.md):
-//   A1.2  zero-config: `lochis watch` starts with no config and creates .lochis/
-//   A6.3  `lochis history <file>` on a file with no history exits 0 with a clear
+//   A1.2  zero-config: `salvager watch` starts with no config and creates .salvager/
+//   A6.3  `salvager history <file>` on a file with no history exits 0 with a clear
 //         "no history" message (not an opaque error/crash)
 //   A10.1 the end-to-end recovery test: real git repo, watcher running,
 //         uncommitted good work destroyed by `git checkout -- .`, then recovered
-//         via `lochis history` + `lochis restore`, byte-for-byte, with a
+//         via `salvager history` + `salvager restore`, byte-for-byte, with a
 //         reported pre-restore timestamp.
 //
 // Timing is deliberately tolerant: the real binary's debounce is 300ms, so we
@@ -57,19 +57,19 @@ func e2eRepoRoot(t *testing.T) string {
 	return filepath.Dir(thisFile)
 }
 
-// e2eBinary builds (once) the lochis binary and returns its absolute path.
+// e2eBinary builds (once) the salvager binary and returns its absolute path.
 func e2eBinary(t *testing.T) string {
 	t.Helper()
 	root := e2eRepoRoot(t)
 	e2eBinOnce.Do(func() {
 		// Build into the OS temp dir, never the repo tree, so the working tree
 		// stays clean (no stray artifact in `git status`).
-		binDir, err := os.MkdirTemp("", "lochis-e2e-bin-")
+		binDir, err := os.MkdirTemp("", "salvager-e2e-bin-")
 		if err != nil {
 			e2eBinErr = err
 			return
 		}
-		out := filepath.Join(binDir, "lochis")
+		out := filepath.Join(binDir, "salvager")
 		cmd := exec.Command("go", "build", "-o", out, ".")
 		cmd.Dir = root
 		var stderr bytes.Buffer
@@ -82,10 +82,10 @@ func e2eBinary(t *testing.T) string {
 		e2eBinPath = out
 	})
 	if e2eBinErr != nil {
-		t.Fatalf("could not build lochis binary: %v", e2eBinErr)
+		t.Fatalf("could not build salvager binary: %v", e2eBinErr)
 	}
 	if e2eBinPath == "" {
-		t.Fatal("lochis binary was not built")
+		t.Fatal("salvager binary was not built")
 	}
 	return e2eBinPath
 }
@@ -106,7 +106,7 @@ func e2ePoll(t *testing.T, d time.Duration, cond func() bool) bool {
 	return cond()
 }
 
-// e2eRun runs the lochis binary with args in dir, returning stdout, stderr and
+// e2eRun runs the salvager binary with args in dir, returning stdout, stderr and
 // the exit code. A non-zero exit is NOT a fatal in itself: callers assert on it.
 func e2eRun(t *testing.T, dir string, args ...string) (stdout, stderr string, exitCode int) {
 	t.Helper()
@@ -122,7 +122,7 @@ func e2eRun(t *testing.T, dir string, args ...string) (stdout, stderr string, ex
 		if ee, ok := err.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
-			t.Fatalf("failed to run lochis %v: %v", args, err)
+			t.Fatalf("failed to run salvager %v: %v", args, err)
 		}
 	}
 	return outBuf.String(), errBuf.String(), exitCode
@@ -140,7 +140,7 @@ func e2eGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
-// e2eStartWatch starts `lochis watch` as a subprocess in dir and registers a
+// e2eStartWatch starts `salvager watch` as a subprocess in dir and registers a
 // cleanup that signals + kills it so no orphan watcher survives the test.
 func e2eStartWatch(t *testing.T, dir string) *exec.Cmd {
 	t.Helper()
@@ -152,7 +152,7 @@ func e2eStartWatch(t *testing.T, dir string) *exec.Cmd {
 	cmd.Stderr = &errBuf
 	cmd.Stdout = &errBuf
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("failed to start lochis watch: %v", err)
+		t.Fatalf("failed to start salvager watch: %v", err)
 	}
 	t.Cleanup(func() {
 		if cmd.Process != nil {
@@ -189,7 +189,7 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// e2eReadLog parses .lochis/index/<rel>.log directly and returns its revisions
+// e2eReadLog parses .salvager/index/<rel>.log directly and returns its revisions
 // oldest-first. This is the most robust way to get raw ms timestamps and labels
 // (independent of stdout/stderr formatting).
 type e2eRev struct {
@@ -200,7 +200,7 @@ type e2eRev struct {
 
 func e2eReadLog(t *testing.T, projectDir, rel string) []e2eRev {
 	t.Helper()
-	logPath := filepath.Join(projectDir, ".lochis", "index", rel+".log")
+	logPath := filepath.Join(projectDir, ".salvager", "index", rel+".log")
 	f, err := os.Open(logPath)
 	if err != nil {
 		return nil
@@ -225,7 +225,7 @@ func e2eReadLog(t *testing.T, projectDir, rel string) []e2eRev {
 }
 
 // e2eFindRev returns the timestamp of the newest revision whose content equals
-// want (read back via `lochis show`). ok is false if none matches.
+// want (read back via `salvager show`). ok is false if none matches.
 func e2eFindRevByContent(t *testing.T, projectDir, rel string, want []byte) (int64, bool) {
 	t.Helper()
 	revs := e2eReadLog(t, projectDir, rel)
@@ -235,7 +235,7 @@ func e2eFindRevByContent(t *testing.T, projectDir, rel string, want []byte) (int
 		if r.Label == "delete" {
 			continue
 		}
-		objPath := filepath.Join(projectDir, ".lochis", "objects", r.Hash)
+		objPath := filepath.Join(projectDir, ".salvager", "objects", r.Hash)
 		got, err := os.ReadFile(objPath)
 		if err != nil {
 			continue
@@ -249,33 +249,33 @@ func e2eFindRevByContent(t *testing.T, projectDir, rel string, want []byte) (int
 
 // --- A1.2 — zero-config startup ---
 
-func TestE2E_A1_2_ZeroConfigCreatesLochisDir(t *testing.T) {
+func TestE2E_A1_2_ZeroConfigCreatesSalvagerDir(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping watcher subprocess test in -short mode")
 	}
 	proj := t.TempDir()
-	// A fresh project with NO lochis config of any kind. Spec A1.2: `lochis
-	// watch` must start with zero configuration and create .lh/ automatically.
+	// A fresh project with NO salvager config of any kind. Spec A1.2: `salvager
+	// watch` must start with zero configuration and create .salvager/ automatically.
 	// The strongest form of the Given is a completely empty directory.
-	if _, err := os.Stat(filepath.Join(proj, ".lochis")); !os.IsNotExist(err) {
-		t.Fatalf("temp project unexpectedly already has .lochis")
+	if _, err := os.Stat(filepath.Join(proj, ".salvager")); !os.IsNotExist(err) {
+		t.Fatalf("temp project unexpectedly already has .salvager")
 	}
 
 	cmd := e2eStartWatch(t, proj)
 
 	// It must start without prompting (stdin is /dev/null since we attach none)
-	// and create .lochis/ automatically — no account, no config questions.
+	// and create .salvager/ automatically — no account, no config questions.
 	ok := e2ePoll(t, 6*time.Second, func() bool {
-		fi, err := os.Stat(filepath.Join(proj, ".lochis"))
+		fi, err := os.Stat(filepath.Join(proj, ".salvager"))
 		return err == nil && fi.IsDir()
 	})
 	if !ok {
-		t.Fatal("`lochis watch` did not create a .lochis/ directory (zero-config startup failed)")
+		t.Fatal("`salvager watch` did not create a .salvager/ directory (zero-config startup failed)")
 	}
 	// The process must still be alive (it did not exit demanding config) — i.e.
 	// it is running as a long-lived watcher, not crashed at startup.
 	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-		t.Fatalf("`lochis watch` exited early instead of running: %v", cmd.ProcessState)
+		t.Fatalf("`salvager watch` exited early instead of running: %v", cmd.ProcessState)
 	}
 }
 
@@ -286,7 +286,7 @@ func TestE2E_A6_3_HistoryNoHistoryMessage(t *testing.T) {
 		t.Skip("skipping CLI e2e in -short mode")
 	}
 	proj := t.TempDir()
-	// A file that exists but was never captured (no watcher ran, no .lochis).
+	// A file that exists but was never captured (no watcher ran, no .salvager).
 	if err := os.WriteFile(filepath.Join(proj, "somefile.txt"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestE2E_A10_1_RecoverAfterDestructiveGitCheckout(t *testing.T) {
 	}
 
 	// 3. Write UNCOMMITTED good work into the tracked file and wait past the
-	//    real 300ms debounce so lochis records it.
+	//    real 300ms debounce so salvager records it.
 	good := []byte("GOOD UNCOMMITTED WORK that the agent must not lose\n")
 	if err := os.WriteFile(trackedAbs, good, 0o644); err != nil {
 		t.Fatal(err)
@@ -370,7 +370,7 @@ func TestE2E_A10_1_RecoverAfterDestructiveGitCheckout(t *testing.T) {
 		t.Fatal("precondition: good work was not actually destroyed by git checkout")
 	}
 
-	// (a) `lochis history <file>` shows the revision holding the good work.
+	// (a) `salvager history <file>` shows the revision holding the good work.
 	goodTs, ok := e2eFindRevByContent(t, proj, tracked, good)
 	if !ok {
 		t.Fatalf("good revision missing from store after destruction; log=%+v", e2eReadLog(t, proj, tracked))
@@ -386,7 +386,7 @@ func TestE2E_A10_1_RecoverAfterDestructiveGitCheckout(t *testing.T) {
 			goodTs, histOut, histErr)
 	}
 
-	// (b) `lochis restore <file> <ts>` brings the good work back byte-for-byte.
+	// (b) `salvager restore <file> <ts>` brings the good work back byte-for-byte.
 	resOut, resErr, resCode := e2eRun(t, proj, "restore", tracked, strconv.FormatInt(goodTs, 10))
 	if resCode != 0 {
 		t.Fatalf("restore exited %d\nstdout=%q\nstderr=%q", resCode, resOut, resErr)
