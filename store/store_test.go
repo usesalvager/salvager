@@ -176,7 +176,7 @@ func TestRecordDeletion(t *testing.T) {
 
 	write(t, root, "a.txt", "alive")
 	s.Record("a.txt")
-	os.Remove(filepath.Join(root, "a.txt"))
+	_ = os.Remove(filepath.Join(root, "a.txt")) // simulate a deletion; a failure surfaces in the assertion below
 	s.Record("a.txt")
 
 	revs, _ := s.List("a.txt")
