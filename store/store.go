@@ -213,17 +213,19 @@ func (s *FS) writeObject(hash string, content []byte) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	// On any failure below, best-effort remove the temp; the returned error is
+	// the real cause, so a failed cleanup must not mask it.
 	if _, err := tmp.Write(content); err != nil {
 		tmp.Close()
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return nil
@@ -514,17 +516,19 @@ func (s *FS) Restore(relPath string, ts int64) (int64, error) {
 		return 0, err
 	}
 	tmpName := tmp.Name()
+	// On any failure below, best-effort remove the temp; the returned error is
+	// the real cause, so a failed cleanup must not mask it.
 	if _, err := tmp.Write(content); err != nil {
 		tmp.Close()
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return 0, err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return 0, err
 	}
 	if err := os.Rename(tmpName, abs); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return 0, err
 	}
 
@@ -688,13 +692,15 @@ func (s *FS) rewriteLog(relPath string, kept []Revision) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	// On any failure below, best-effort remove the temp; the returned error is
+	// the real cause, so a failed cleanup must not mask it.
 	if _, err := tmp.WriteString(b.String()); err != nil {
 		tmp.Close()
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return os.Rename(tmpName, lp)
