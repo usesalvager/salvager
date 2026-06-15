@@ -25,6 +25,7 @@ import (
 	"github.com/usesalvager/salvager/ignore"
 	"github.com/usesalvager/salvager/mcp"
 	"github.com/usesalvager/salvager/store"
+	"github.com/usesalvager/salvager/version"
 	"github.com/usesalvager/salvager/watch"
 )
 
@@ -64,6 +65,8 @@ func main() {
 		cmdMCP(root)
 	case "gc":
 		cmdGC(root, args)
+	case "--version", "-version", "version":
+		fmt.Println("salvager", version.Version)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:

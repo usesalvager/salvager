@@ -10,6 +10,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/usesalvager/salvager/store"
+	"github.com/usesalvager/salvager/version"
 )
 
 // Backend is the slice of the store the MCP server consumes.
@@ -77,7 +78,7 @@ func short(hash string) string {
 
 // NewServer builds the MCP server backed by b.
 func NewServer(b Backend) *mcp.Server {
-	s := mcp.NewServer(&mcp.Implementation{Name: "salvager", Version: "1.0.0"}, nil)
+	s := mcp.NewServer(&mcp.Implementation{Name: "salvager", Version: version.Version}, nil)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "salvager_list_versions",

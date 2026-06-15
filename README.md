@@ -15,6 +15,16 @@ go build -o salvager .
 
 Single static binary, no runtime. macOS and Linux supported; Windows best-effort.
 
+A plain build reports its version as `dev` (`salvager --version` → `salvager dev`).
+For a release, inject the version via ldflags:
+
+```sh
+CGO_ENABLED=0 go build -ldflags "-X 'github.com/usesalvager/salvager/version.Version=1.0.0'" -o salvager .
+```
+
+The same value backs both `salvager --version` and the version the MCP server
+advertises to clients — one source of truth (`version.Version`).
+
 ## Usage
 
 ```
