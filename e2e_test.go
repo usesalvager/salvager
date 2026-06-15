@@ -12,6 +12,12 @@ package main
 //         uncommitted good work destroyed by `git checkout -- .`, then recovered
 //         via `salvager history` + `salvager restore`, byte-for-byte, with a
 //         reported pre-restore timestamp.
+//   A10.2 the product's strongest claim, made falsifiable: uncommitted work that
+//         was never staged is destroyed by `git reset --hard`, and we PROVE git
+//         itself cannot bring it back (the blob is absent from git's entire
+//         object database, fsck --lost-found, and every reflog) — yet salvager
+//         recovers it byte-for-byte. git does not protect uncommitted work;
+//         salvager does.
 //
 // Timing is deliberately tolerant: the real binary's debounce is 300ms, so we
 // poll up to several seconds. Every subprocess is killed in cleanup so no
@@ -138,6 +144,28 @@ func e2eGit(t *testing.T, dir string, args ...string) {
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, errBuf.String())
 	}
+}
+
+// e2eGitOut runs a git command in dir and returns trimmed stdout plus the exit
+// code, WITHOUT failing the test on a non-zero exit. Some git probes are
+// *expected* to fail and the failure is the assertion — e.g. `git cat-file -e
+// <hash>` on an object git never stored exits non-zero, which is precisely how
+// A10.2 proves git has no record of the destroyed work. It still fatals if git
+// cannot be launched at all.
+func e2eGitOut(t *testing.T, dir string, args ...string) (stdout string, exitCode int) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return strings.TrimSpace(outBuf.String()), ee.ExitCode()
+		}
+		t.Fatalf("failed to run git %v: %v", args, err)
+	}
+	return strings.TrimSpace(outBuf.String()), 0
 }
 
 // e2eStartWatch starts `salvager watch` as a subprocess in dir and registers a
@@ -456,4 +484,181 @@ func e2eParsePreRestoreTs(t *testing.T, out string) int64 {
 		return 0
 	}
 	return ts
+}
+
+// --- A10.2 — git genuinely cannot recover uncommitted work; salvager can ---
+
+// TestE2E_A10_2_RecoverUncommittedWorkGitCannot is the falsifiable form of
+// Salvager's single strongest argument: *git does not protect uncommitted work,
+// Salvager does.*
+//
+// The scenario an agent creates in the wild: you make valuable edits, haven't
+// committed (or even staged) them yet, and the agent "tidies up" the repo with a
+// destructive command. Here that command is `git reset --hard`. Because the work
+// was never added to git's object database, this is the one failure git's own
+// safety nets cannot undo:
+//   - `git checkout`/`git restore` only reach committed or staged states.
+//   - `git reflog` only records ref movements (commits, resets) — never raw
+//     working-tree edits, so there is no reflog entry to recover from.
+//   - `git fsck --lost-found` can rescue *dangling committed/blobbed* objects,
+//     but a working-tree edit that was never `git add`-ed was never hashed into
+//     the object store, so there is nothing dangling to find.
+//
+// The heart of this test is step 5: we PROVE, three independent ways, that git
+// has no record of the destroyed content. If a skeptic claims "git could've
+// gotten it back", these assertions are the rebuttal. Salvager, watching the
+// filesystem, captured the edit the instant it hit disk — below git's level
+// entirely — and restores it byte-for-byte.
+//
+// Fully deterministic (no LLM/agent, no network): the agent's destructive action
+// is simulated by running the exact git command an agent would. Runs in CI via
+// `go test ./...`, exactly like A10.1.
+func TestE2E_A10_2_RecoverUncommittedWorkGitCannot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy end-to-end recovery test in -short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	proj := t.TempDir()
+
+	// 1. A real git repo with a committed baseline.
+	e2eGit(t, proj, "init", "-q")
+	e2eGit(t, proj, "config", "user.email", "test@example.com")
+	e2eGit(t, proj, "config", "user.name", "Test")
+	tracked := "work.txt"
+	trackedAbs := filepath.Join(proj, tracked)
+	baseline := []byte("baseline committed content\n")
+	if err := os.WriteFile(trackedAbs, baseline, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e2eGit(t, proj, "add", tracked)
+	e2eGit(t, proj, "commit", "-q", "-m", "baseline")
+
+	// 2. Start the watcher and let it record the baseline (initial revision).
+	e2eStartWatch(t, proj)
+	if !e2ePoll(t, 6*time.Second, func() bool {
+		return len(e2eReadLog(t, proj, tracked)) >= 1
+	}) {
+		t.Fatal("watcher never recorded the initial revision of the tracked file")
+	}
+
+	// 3. Write valuable UNCOMMITTED work and — crucially — never `git add` it.
+	//    This is the work that exists only on disk: git has not hashed it into
+	//    its object database, so git has no way to ever see it again once the
+	//    working-tree copy is gone. Wait past the real 300ms debounce so salvager
+	//    records it.
+	good := []byte("GOOD UNCOMMITTED WORK that the agent must not lose\n")
+	if err := os.WriteFile(trackedAbs, good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !e2ePoll(t, 6*time.Second, func() bool {
+		_, ok := e2eFindRevByContent(t, proj, tracked, good)
+		return ok
+	}) {
+		t.Fatalf("watcher never recorded the good uncommitted work; log=%+v", e2eReadLog(t, proj, tracked))
+	}
+
+	// 4. Compute the git blob hash this content *would* have. `git hash-object`
+	//    WITHOUT -w only computes the SHA; it does not write to .git/objects. So
+	//    even after asking git for the hash, git still has no object for it —
+	//    which we assert right now, before any destruction: merely editing a file
+	//    (no add, no commit) never puts it in git's object database.
+	goodHash, code := e2eGitOut(t, proj, "hash-object", tracked)
+	if code != 0 || goodHash == "" {
+		t.Fatalf("could not compute would-be git blob hash (exit %d, hash %q)", code, goodHash)
+	}
+	if _, code := e2eGitOut(t, proj, "cat-file", "-e", goodHash); code == 0 {
+		t.Fatalf("precondition failed: git already has an object for the uncommitted "+
+			"work (hash %s); the test cannot prove git-can't if git was given a copy", goodHash)
+	}
+
+	// 5. The destructive, agent-style command: a hard reset that throws away the
+	//    uncommitted working-tree edit. This is the failure git cannot undo.
+	e2eGit(t, proj, "reset", "--hard", "HEAD")
+
+	// The work is gone from disk: reverted to baseline, not the good content.
+	onDisk, err := os.ReadFile(trackedAbs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(onDisk, baseline) {
+		t.Fatalf("precondition: `git reset --hard` should have reverted to baseline, got %q", onDisk)
+	}
+	if bytes.Equal(onDisk, good) {
+		t.Fatal("precondition: good work was not actually destroyed by git reset --hard")
+	}
+
+	// --- THE HEART OF THE TEST: prove git genuinely cannot recover it. ---
+	// Three independent probes, each the thing a skeptic ("git could get it
+	// back!") would actually reach for. All three must come up empty.
+
+	// (i) Targeted: git has no object whose hash is the destroyed content's hash.
+	if _, code := e2eGitOut(t, proj, "cat-file", "-e", goodHash); code == 0 {
+		t.Fatalf("git CAN recover the work: object %s exists in git's database — "+
+			"the central claim of this test is violated", goodHash)
+	}
+
+	// (ii) Comprehensive: sweep EVERY object git knows about (commits, trees,
+	//      blobs, reachable or not) and confirm the destroyed content's hash is
+	//      among none of them. This subsumes (i) but proves it exhaustively.
+	allObjs, code := e2eGitOut(t, proj, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)")
+	if code != 0 {
+		t.Fatalf("could not enumerate git objects (exit %d)", code)
+	}
+	if strings.Contains(allObjs, goodHash) {
+		t.Fatalf("git CAN recover the work: hash %s is present in git's full object "+
+			"set:\n%s", goodHash, allObjs)
+	}
+
+	// (iii) The canonical "rescue dangling work" command. fsck --lost-found is
+	//       exactly what you run to recover orphaned objects; it cannot list what
+	//       git never hashed. Confirm the destroyed content's hash is absent.
+	fsckOut, _ := e2eGitOut(t, proj, "fsck", "--unreachable", "--lost-found", "--no-reflogs")
+	if strings.Contains(fsckOut, goodHash) {
+		t.Fatalf("git CAN recover the work: fsck --lost-found surfaced hash %s:\n%s",
+			goodHash, fsckOut)
+	}
+
+	// Sanity-check the probes aren't vacuously passing: the baseline blob (which
+	// git DID commit) MUST be found by the same enumeration. If git can see the
+	// committed blob but not the uncommitted one, the contrast is real.
+	baseHash, _ := e2eGitOut(t, proj, "hash-object", tracked)
+	if baseHash == "" || !strings.Contains(allObjs, baseHash) {
+		t.Fatalf("probe sanity failed: committed baseline blob %q not found in git's "+
+			"object set — the git-can't probes may be vacuous", baseHash)
+	}
+
+	// --- Salvager CAN recover it. Same CLI path as A10.1. ---
+
+	// (a) The good revision still lives in salvager's store, and `salvager
+	//     history` surfaces it (raw ms printed to stderr by main.go).
+	goodTs, ok := e2eFindRevByContent(t, proj, tracked, good)
+	if !ok {
+		t.Fatalf("good revision missing from salvager store after destruction; log=%+v",
+			e2eReadLog(t, proj, tracked))
+	}
+	histOut, histErr, histCode := e2eRun(t, proj, "history", tracked)
+	if histCode != 0 {
+		t.Fatalf("history exited %d\nstdout=%q\nstderr=%q", histCode, histOut, histErr)
+	}
+	if !strings.Contains(histOut+histErr, strconv.FormatInt(goodTs, 10)) {
+		t.Errorf("history output does not reference the good revision ts %d\nstdout=%q\nstderr=%q",
+			goodTs, histOut, histErr)
+	}
+
+	// (b) `salvager restore` brings the work git could not recover back to disk,
+	//     byte-for-byte — the payoff line of the whole scenario.
+	resOut, resErr, resCode := e2eRun(t, proj, "restore", tracked, strconv.FormatInt(goodTs, 10))
+	if resCode != 0 {
+		t.Fatalf("restore exited %d\nstdout=%q\nstderr=%q", resCode, resOut, resErr)
+	}
+	restored, err := os.ReadFile(trackedAbs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, good) {
+		t.Fatalf("restore did not bring the work back byte-for-byte\n got=%q\nwant=%q", restored, good)
+	}
 }
