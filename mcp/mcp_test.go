@@ -414,6 +414,90 @@ func TestMCP_Restore_ReportsPreRestoreAndIsReversible(t *testing.T) {
 	}
 }
 
+// medianFixture is the A10 scenario as two states of one file: a "first-seen"
+// revision that HOLDS a median() function and a later "modify" revision that
+// lost it. Returns (withWork, withoutWork).
+func medianFixture() (string, string) {
+	withWork := "def mean(xs):\n" +
+		"    return sum(xs) / len(xs)\n" +
+		"\n" +
+		"\n" +
+		"def median(xs):\n" +
+		"    s = sorted(xs)\n" +
+		"    n = len(s)\n" +
+		"    mid = n // 2\n" +
+		"    if n % 2:\n" +
+		"        return s[mid]\n" +
+		"    return (s[mid - 1] + s[mid]) / 2\n"
+	withoutWork := "def mean(xs):\n" +
+		"    return sum(xs) / len(xs)\n"
+	return withWork, withoutWork
+}
+
+// seedMedianBaseline records the two-revision A10 baseline (first-seen WITH the
+// work, modify WITHOUT it) and leaves disk in the work-lost state. Returns the
+// timestamp of the first-seen revision that holds the work.
+func seedMedianBaseline(t *testing.T, s *store.FS, root string) (firstSeenTs int64) {
+	t.Helper()
+	withWork, withoutWork := medianFixture()
+	mcpWrite(t, root, "stats.py", []byte(withWork))
+	if err := s.Record("stats.py"); err != nil {
+		t.Fatal(err)
+	}
+	mcpWrite(t, root, "stats.py", []byte(withoutWork))
+	if err := s.Record("stats.py"); err != nil {
+		t.Fatal(err)
+	}
+	revs, _ := s.List("stats.py") // newest first: modify, first-seen
+	return revs[len(revs)-1].Timestamp
+}
+
+// Recovering lost work through lochis_restore leaves the safe-path trace in
+// history: a pre-restore revision followed by a restore revision, NOT a generic
+// modify. The restore tool stays valid after reverting the inspect/restore
+// separation, and anyone (human or agent) who uses it must still get the
+// reversible pre-restore + restore pair, with the work back on disk byte-for-byte.
+func TestMCP_Restore_LeavesPreRestoreThenRestoreTrace(t *testing.T) {
+	ctx := context.Background()
+	s, root := mcpSeedStore(t)
+	firstSeenTs := seedMedianBaseline(t, s, root)
+	withWork, _ := medianFixture()
+
+	cs := mcpClientFor(t, s)
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "lochis_restore",
+		Arguments: map[string]any{"file": "stats.py", "timestamp": firstSeenTs},
+	})
+	if err != nil {
+		t.Fatalf("CallTool restore: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error result: %s", mcpResultJSON(t, res))
+	}
+
+	// The work is back on disk, byte-for-byte.
+	onDisk, err := os.ReadFile(filepath.Join(root, "stats.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != withWork {
+		t.Errorf("after restore, file does not hold the recovered work:\n%s", onDisk)
+	}
+
+	// The history's two newest revisions are the safe-path trace: a pre-restore
+	// (the saved current state) then a restore — never a bare modify.
+	revs, _ := s.List("stats.py") // newest first
+	if len(revs) < 4 {
+		t.Fatalf("want at least 4 revisions (first-seen, modify, pre-restore, restore), got %d", len(revs))
+	}
+	if revs[0].Label != store.LabelRestore {
+		t.Errorf("newest label = %q, want %q", revs[0].Label, store.LabelRestore)
+	}
+	if revs[1].Label != store.LabelPreRestore {
+		t.Errorf("second-newest label = %q, want %q", revs[1].Label, store.LabelPreRestore)
+	}
+}
+
 // A8.4 — revisions written via store.Record are visible through the MCP backend
 // (same .lochis/). Asserted explicitly: write via store, read via MCP tool, and
 // confirm the revision count/timestamps match what the store reports.
