@@ -1,0 +1,87 @@
+name: CI & Release
+
+# CI runs on every push to main and on PRs.
+# Release runs only when a v* tag is pushed, and only if CI passed first.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+# Allow the release job to create a GitHub Release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # single source of truth; stays in sync with go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  release:
+    name: Release binaries
+    # Only on a v* tag, and only after CI succeeds.
+    needs: ci
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # same toolchain as the ci job
+          cache: true
+
+      - name: Build static binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          OUT="salvager-${VERSION}-${GOOS}-${GOARCH}"
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X 'github.com/usesalvager/salvager/version.Version=${VERSION}'" \
+            -o "${OUT}" \
+            .
+          # Checksum alongside the binary for integrity verification.
+          sha256sum "${OUT}" > "${OUT}.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            salvager-*-${{ matrix.goos }}-${{ matrix.goarch }}
+            salvager-*-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
