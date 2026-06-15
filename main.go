@@ -122,11 +122,17 @@ func cmdHistory(root string, args []string) {
 		return
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "TIMESTAMP\tHASH\tLABEL")
+	fmt.Fprintln(tw, "TIMESTAMP\tHASH\tLABEL\tLINES\tΔLINES\tSTART")
 	for _, r := range revs {
-		fmt.Fprintf(tw, "%s\t%s\t%s\n",
+		lines, delta, start := "-", "-", ""
+		if r.HasSignal {
+			lines = strconv.Itoa(r.Lines)
+			delta = r.DeltaString()
+			start = firstLine(r.Sig)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			time.UnixMilli(r.Timestamp).Format("2006-01-02 15:04:05"),
-			shortHash(r.Hash), r.Label)
+			shortHash(r.Hash), r.Label, lines, delta, start)
 	}
 	tw.Flush()
 	fmt.Fprintln(os.Stderr, "\nrestore with: lochis restore", args[0], "<timestamp-ms>")
@@ -237,6 +243,18 @@ func shortHash(h string) string {
 		return h[:8]
 	}
 	return h
+}
+
+// firstLine returns the first line of a start signature, clamped, so the history
+// table stays one row per revision even when the signature spans several lines.
+func firstLine(sig string) string {
+	if i := strings.IndexByte(sig, '\n'); i >= 0 {
+		sig = sig[:i]
+	}
+	if len(sig) > 60 {
+		sig = sig[:60]
+	}
+	return sig
 }
 
 func fatal(err error)           { fmt.Fprintln(os.Stderr, "lochis:", err); os.Exit(1) }

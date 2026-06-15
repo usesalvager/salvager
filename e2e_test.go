@@ -209,8 +209,10 @@ func e2eReadLog(t *testing.T, projectDir, rel string) []e2eRev {
 	var revs []e2eRev
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		parts := strings.SplitN(sc.Text(), "\t", 3)
-		if len(parts) != 3 {
+		// A .log line is either the legacy 3-column form or the 7-column signal
+		// form; only ts/hash/label are needed here, so take the first 3 fields.
+		parts := strings.Split(sc.Text(), "\t")
+		if len(parts) < 3 {
 			continue
 		}
 		ts, err := strconv.ParseInt(parts[0], 10, 64)

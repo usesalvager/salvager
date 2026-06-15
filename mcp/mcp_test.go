@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -160,6 +161,142 @@ func TestMCP_ListVersions(t *testing.T) {
 	}
 	if out.Versions[0].HashShort != short(revs[0].Hash) {
 		t.Errorf("newest hash_short = %q, want %q", out.Versions[0].HashShort, short(revs[0].Hash))
+	}
+}
+
+// A10 regression — the failure that motivated the content signal. A file is
+// captured WITH a function (median), then a later revision loses it. The agent
+// in the original trace saw only timestamps + labels, inspected only the broken
+// revision, and wrongly concluded the function "was never added". list_versions
+// must now let an agent tell which revision holds the work — the line delta and
+// signature — WITHOUT calling lochis_get_version on a single revision.
+func TestMCP_ListVersions_Signal_DistinguishesByDelta(t *testing.T) {
+	ctx := context.Background()
+	s, root := mcpSeedStore(t)
+
+	withMedian := "def mean(xs):\n" +
+		"    return sum(xs) / len(xs)\n" +
+		"\n" +
+		"\n" +
+		"def median(xs):\n" +
+		"    s = sorted(xs)\n" +
+		"    n = len(s)\n" +
+		"    mid = n // 2\n" +
+		"    if n % 2:\n" +
+		"        return s[mid]\n" +
+		"    return (s[mid - 1] + s[mid]) / 2\n"
+	withoutMedian := "def mean(xs):\n" +
+		"    return sum(xs) / len(xs)\n"
+
+	mcpWrite(t, root, "stats.py", []byte(withMedian))
+	if err := s.Record("stats.py"); err != nil {
+		t.Fatal(err)
+	}
+	mcpWrite(t, root, "stats.py", []byte(withoutMedian))
+	if err := s.Record("stats.py"); err != nil {
+		t.Fatal(err)
+	}
+
+	cs := mcpClientFor(t, s)
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "lochis_list_versions",
+		Arguments: map[string]any{"file": "stats.py"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error result: %s", mcpResultJSON(t, res))
+	}
+
+	var out listOutput
+	if err := json.Unmarshal(mcpResultJSON(t, res), &out); err != nil {
+		t.Fatalf("decode list output: %v", err)
+	}
+	if len(out.Versions) != 2 {
+		t.Fatalf("want 2 versions, got %d", len(out.Versions))
+	}
+
+	modify := out.Versions[0]    // newest: median removed
+	firstSeen := out.Versions[1] // oldest: median present
+
+	// The whole point: every revision exposes its signal up front.
+	if !modify.HasSignal || !firstSeen.HasSignal {
+		t.Fatalf("a revision is missing its signal: modify=%+v first-seen=%+v", modify, firstSeen)
+	}
+
+	// 1. The oldest revision is NOT presented as an empty baseline: its label is
+	// the explicit "first-seen", never the misleading "initial".
+	if firstSeen.Label != string(store.LabelInitial) {
+		t.Errorf("oldest label = %q, want the LabelInitial value", firstSeen.Label)
+	}
+	if firstSeen.Label != "first-seen" {
+		t.Errorf("LabelInitial wire value = %q, want \"first-seen\" (must not read as an empty baseline)", firstSeen.Label)
+	}
+
+	// 2. The revision that HOLDS the work is identifiable by line count alone.
+	if firstSeen.Lines <= modify.Lines {
+		t.Errorf("first-seen lines (%d) should exceed modify lines (%d): the work lives in the larger revision",
+			firstSeen.Lines, modify.Lines)
+	}
+
+	// 3. The delta on the broken revision is clearly NEGATIVE — lines were
+	// removed — which directly refutes a "only formatting changed" reading.
+	if !strings.HasPrefix(modify.DeltaLines, "-") {
+		t.Errorf("modify delta_lines = %q, want a negative delta (work was removed)", modify.DeltaLines)
+	}
+	wantDelta := strconv.Itoa(modify.Lines - firstSeen.Lines)
+	if got := strings.TrimPrefix(modify.DeltaLines, "+"); got != wantDelta {
+		t.Errorf("modify delta_lines = %q, want %q (modify.Lines - firstSeen.Lines)", modify.DeltaLines, wantDelta)
+	}
+
+	// 4. The signatures are present so an agent can eyeball the start of each
+	// revision without reading the whole object.
+	if firstSeen.Signature == "" || modify.Signature == "" {
+		t.Errorf("signatures must be present: first-seen=%q modify=%q", firstSeen.Signature, modify.Signature)
+	}
+}
+
+// list_versions surfaces legacy (pre-signal) revisions as "signal unavailable"
+// — has_signal false, no fabricated numbers — rather than failing.
+func TestMCP_ListVersions_LegacyRevisionHasNoSignal(t *testing.T) {
+	ctx := context.Background()
+	s, root := mcpSeedStore(t)
+
+	// Hand-write a legacy three-column log line (the old on-disk format).
+	lp := filepath.Join(root, store.Dir, "index", "old.txt.log")
+	if err := os.MkdirAll(filepath.Dir(lp), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lp, []byte("1700000000000\tdeadbeefdeadbeef\tmodify\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cs := mcpClientFor(t, s)
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "lochis_list_versions",
+		Arguments: map[string]any{"file": "old.txt"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("legacy log must list without error: %s", mcpResultJSON(t, res))
+	}
+
+	var out listOutput
+	if err := json.Unmarshal(mcpResultJSON(t, res), &out); err != nil {
+		t.Fatalf("decode list output: %v", err)
+	}
+	if len(out.Versions) != 1 {
+		t.Fatalf("want 1 legacy version, got %d", len(out.Versions))
+	}
+	v := out.Versions[0]
+	if v.HasSignal {
+		t.Errorf("legacy version: has_signal = true, want false")
+	}
+	if v.DeltaLines != "" || v.Signature != "" || v.Lines != 0 {
+		t.Errorf("legacy version leaked a fabricated signal: %+v", v)
 	}
 }
 

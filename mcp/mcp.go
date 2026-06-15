@@ -30,6 +30,15 @@ type versionInfo struct {
 	Timestamp      int64  `json:"timestamp"`
 	HashShort      string `json:"hash_short"`
 	Label          string `json:"label"`
+
+	// Content signal, computed at capture and read here without opening the
+	// object. has_signal is false for legacy revisions recorded before the
+	// signal existed; their lines/bytes/delta/signature are omitted.
+	HasSignal  bool   `json:"has_signal"`
+	Lines      int    `json:"lines,omitempty"`
+	Bytes      int    `json:"bytes,omitempty"`
+	DeltaLines string `json:"delta_lines,omitempty"` // "+N" / "-N" vs the previous version; "?" if unknowable
+	Signature  string `json:"signature,omitempty"`   // first non-empty lines; "" for a deletion or binary
 }
 
 type listOutput struct {
@@ -71,8 +80,17 @@ func NewServer(b Backend) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "lochis", Version: "1.0.0"}, nil)
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "lochis_list_versions",
-		Description: "List the recorded versions of a file, most recent first.",
+		Name: "lochis_list_versions",
+		Description: "List the recorded versions of a file, most recent first. " +
+			"Each version carries a content signal computed when it was captured — total " +
+			"lines, the line delta vs the previous version (delta_lines, e.g. \"+21\"/\"-21\"), " +
+			"and the first non-empty lines (signature) — so you can tell which version contains " +
+			"a given function or block WITHOUT calling lochis_get_version. " +
+			"The oldest version is labeled \"first-seen\": it already holds the work captured when " +
+			"lochis first saw the file — it is NOT an empty baseline, so inspect it like any other. " +
+			"Before concluding that something was never added or no longer exists, use the signal " +
+			"(especially delta_lines and signature) to find the version that has it; a large positive " +
+			"delta marks where lines were added and a negative delta where they were removed.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, listOutput, error) {
 		revs, err := b.List(in.File)
 		if err != nil {
@@ -80,12 +98,20 @@ func NewServer(b Backend) *mcp.Server {
 		}
 		out := listOutput{Versions: make([]versionInfo, 0, len(revs))}
 		for _, r := range revs {
-			out.Versions = append(out.Versions, versionInfo{
+			vi := versionInfo{
 				TimestampHuman: human(r.Timestamp),
 				Timestamp:      r.Timestamp,
 				HashShort:      short(r.Hash),
 				Label:          string(r.Label),
-			})
+				HasSignal:      r.HasSignal,
+			}
+			if r.HasSignal {
+				vi.Lines = r.Lines
+				vi.Bytes = r.Bytes
+				vi.DeltaLines = r.DeltaString()
+				vi.Signature = r.Sig
+			}
+			out.Versions = append(out.Versions, vi)
 		}
 		return nil, out, nil
 	})

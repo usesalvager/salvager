@@ -6,12 +6,27 @@
 //	├── objects/<sha256>        full content, deduplicated by hash
 //	└── index/<relpath>.log     one line per revision of that file
 //
-// The data is readable without this tool: `ls` and `cat` are enough to
-// recover any version by hand.
+// Each .log line is tab-separated. Lines written before the content signal
+// existed have three columns:
+//
+//	<unix_ms>\t<sha256>\t<label>
+//
+// Newer lines carry a content signal computed once at capture, so a caller can
+// summarize a revision (and tell which one holds a given block of work) without
+// ever reading its object back:
+//
+//	<unix_ms>\t<sha256>\t<label>\t<lines>\t<bytes>\t<delta>\t<quoted-start-signature>
+//
+// where <delta> is the signed line count vs the previous revision ("?" when the
+// previous revision predates the signal) and the start signature is the first
+// few non-empty lines, Go-quoted so it stays on a single tab-free line. Both
+// shapes are readable without this tool: `ls` and `cat` recover any version by
+// hand.
 package store
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -30,7 +45,11 @@ const Dir = ".lochis"
 type Label string
 
 const (
-	LabelInitial    Label = "initial"
+	// LabelInitial marks the first revision lochis recorded for a file. Its
+	// value is "first-seen", not "initial", on purpose: this revision already
+	// holds the content captured the moment lochis first saw the file — it is
+	// NOT an empty starting point, and an agent must inspect it like any other.
+	LabelInitial    Label = "first-seen"
 	LabelModify     Label = "modify"
 	LabelDelete     Label = "delete"
 	LabelPreRestore Label = "pre-restore"
@@ -42,6 +61,31 @@ type Revision struct {
 	Timestamp int64 // unix milliseconds
 	Hash      string
 	Label     Label
+
+	// Content signal: computed once at capture (from the content already in
+	// memory for the hash) and stored in the .log line, so List can summarize a
+	// revision without reading its object. HasSignal is false for legacy lines
+	// written before the signal existed — treat those as "signal unavailable",
+	// never as an error.
+	HasSignal  bool
+	Lines      int    // total line count of the revision's content (0 for a deletion)
+	Bytes      int    // byte length of the content (0 for a deletion)
+	Delta      int    // signed line delta vs the previous revision at capture time
+	DeltaKnown bool   // false when the previous revision had no signal to diff against
+	Sig        string // first up to 3 non-empty lines (empty for binary or no content)
+}
+
+// DeltaString renders the signed line delta for display: "+N"/"-N", "?" when it
+// could not be computed (the previous revision predates the signal), or "" when
+// the revision itself carries no signal at all.
+func (r Revision) DeltaString() string {
+	if !r.HasSignal {
+		return ""
+	}
+	if !r.DeltaKnown {
+		return "?"
+	}
+	return fmt.Sprintf("%+d", r.Delta)
 }
 
 // Store is the contract the rest of the program depends on. Restore is the
@@ -126,12 +170,12 @@ func (s *FS) record(relPath string, force Label) error {
 			if hasLast {
 				h = last.Hash
 			}
-			return s.appendLog(relPath, force, h)
+			return s.appendLog(relPath, force, h, computeSig(nil, last, hasLast))
 		}
 		if !hasLast || last.Label == LabelDelete {
 			return nil // never tracked, or already known deleted
 		}
-		return s.appendLog(relPath, LabelDelete, last.Hash)
+		return s.appendLog(relPath, LabelDelete, last.Hash, computeSig(nil, last, hasLast))
 	}
 
 	hash := sha256hex(content)
@@ -151,7 +195,7 @@ func (s *FS) record(relPath string, force Label) error {
 			label = LabelInitial
 		}
 	}
-	return s.appendLog(relPath, label, hash)
+	return s.appendLog(relPath, label, hash, computeSig(content, last, hasLast))
 }
 
 // writeObject stores content at objects/<hash>, atomically, once. No-op if the
@@ -185,10 +229,108 @@ func (s *FS) writeObject(hash string, content []byte) error {
 	return nil
 }
 
+// revSig is the content signal for one revision, computed at capture from the
+// content already in memory. For a deletion content is empty: lines/bytes are 0
+// and sig is "".
+type revSig struct {
+	lines      int
+	bytes      int
+	delta      int
+	deltaKnown bool
+	sig        string
+}
+
+// computeSig builds the content signal for content (nil/empty for a deletion),
+// diffing the line count against the previous revision. hasLast false means this
+// is the first revision of the file, so every line counts as added. When the
+// previous revision predates the signal its line count is unknown, so the delta
+// is left unknowable rather than guessed.
+func computeSig(content []byte, last Revision, hasLast bool) revSig {
+	n := lineCount(content)
+	rs := revSig{lines: n, bytes: len(content), sig: startSignature(content)}
+	switch {
+	case !hasLast:
+		rs.delta, rs.deltaKnown = n, true // first revision: all lines are new
+	case last.HasSignal:
+		rs.delta, rs.deltaKnown = n-last.Lines, true
+	default:
+		rs.deltaKnown = false // previous revision has no signal to diff against
+	}
+	return rs
+}
+
+// lineCount counts newline-delimited lines, counting a final unterminated line.
+// Empty content is 0 lines. Matches the intuition behind a "+N/-N lines" delta.
+func lineCount(content []byte) int {
+	if len(content) == 0 {
+		return 0
+	}
+	n := bytes.Count(content, []byte{'\n'})
+	if content[len(content)-1] != '\n' {
+		n++
+	}
+	return n
+}
+
+// startSignature returns the first up to 3 non-empty lines as a lightweight
+// fingerprint of how the content begins. It degrades gracefully: binary content
+// (a NUL byte in the head, the standard heuristic) yields "" rather than a mess
+// of raw bytes, and each line is clamped so the signature stays glanceable. The
+// caller Go-quotes the result before storage, so any stray control bytes can
+// never corrupt the single-line .log format.
+func startSignature(content []byte) string {
+	if len(content) == 0 {
+		return ""
+	}
+	head := content
+	if len(head) > 8192 {
+		head = head[:8192]
+	}
+	if bytes.IndexByte(head, 0) >= 0 {
+		return "" // binary: no meaningful text signature
+	}
+	var picked []string
+	rest := content
+	for len(picked) < 3 && len(rest) > 0 {
+		line := rest
+		if i := bytes.IndexByte(rest, '\n'); i >= 0 {
+			line, rest = rest[:i], rest[i+1:]
+		} else {
+			rest = nil
+		}
+		s := strings.TrimRight(string(line), "\r")
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		if len(s) > 120 {
+			s = s[:120]
+		}
+		picked = append(picked, s)
+	}
+	return strings.Join(picked, "\n")
+}
+
+// formatLine serializes one revision to its .log line. Revisions carrying a
+// signal write the seven-column form; legacy revisions (HasSignal false, only
+// ever produced by parsing an old three-column line) round-trip unchanged so GC
+// never fabricates a signal it cannot compute without reading the object.
+func formatLine(r Revision) string {
+	if !r.HasSignal {
+		return fmt.Sprintf("%d\t%s\t%s\n", r.Timestamp, r.Hash, r.Label)
+	}
+	delta := "?"
+	if r.DeltaKnown {
+		delta = strconv.Itoa(r.Delta)
+	}
+	return fmt.Sprintf("%d\t%s\t%s\t%d\t%d\t%s\t%s\n",
+		r.Timestamp, r.Hash, r.Label, r.Lines, r.Bytes, delta, strconv.Quote(r.Sig))
+}
+
 // appendLog appends one revision line to the file's .log, O_APPEND, with a
 // timestamp guaranteed strictly greater than the previous line's so every
-// revision of a file is uniquely addressable by timestamp.
-func (s *FS) appendLog(relPath string, label Label, hash string) error {
+// revision of a file is uniquely addressable by timestamp. The content signal
+// is computed by the caller (which already holds the content) and stored inline.
+func (s *FS) appendLog(relPath string, label Label, hash string, sig revSig) error {
 	lp := s.logPath(relPath)
 	if err := os.MkdirAll(filepath.Dir(lp), 0o755); err != nil {
 		return err
@@ -202,22 +344,51 @@ func (s *FS) appendLog(relPath string, label Label, hash string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = fmt.Fprintf(f, "%d\t%s\t%s\n", ts, hash, label)
+	_, err = f.WriteString(formatLine(Revision{
+		Timestamp: ts, Hash: hash, Label: label,
+		HasSignal: true,
+		Lines:     sig.lines, Bytes: sig.bytes,
+		Delta: sig.delta, DeltaKnown: sig.deltaKnown,
+		Sig: sig.sig,
+	}))
 	return err
 }
 
 // parseLine parses one .log line. ok is false for malformed lines (which are
-// tolerated, e.g. a final line truncated by a crash).
+// tolerated, e.g. a final line truncated by a crash). Both the legacy
+// three-column form and the seven-column signal form are accepted; a line whose
+// signal columns are corrupt is kept as a signal-less revision rather than
+// dropped, so a recoverable revision is never lost to a bad signal.
 func parseLine(line string) (Revision, bool) {
-	parts := strings.SplitN(line, "\t", 3)
-	if len(parts) != 3 {
+	parts := strings.SplitN(line, "\t", 7)
+	if len(parts) < 3 {
 		return Revision{}, false
 	}
 	ts, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
 		return Revision{}, false
 	}
-	return Revision{Timestamp: ts, Hash: parts[1], Label: Label(parts[2])}, true
+	r := Revision{Timestamp: ts, Hash: parts[1], Label: Label(parts[2])}
+	if len(parts) == 7 {
+		applySignal(&r, parts[3], parts[4], parts[5], parts[6])
+	}
+	return r, true
+}
+
+// applySignal fills the content-signal fields from the four trailing columns. A
+// malformed column leaves the revision signal-less (HasSignal stays false).
+func applySignal(r *Revision, linesF, bytesF, deltaF, sigF string) {
+	lines, err1 := strconv.Atoi(linesF)
+	byteN, err2 := strconv.Atoi(bytesF)
+	sig, err3 := strconv.Unquote(sigF)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return
+	}
+	r.Lines, r.Bytes, r.Sig, r.HasSignal = lines, byteN, sig, true
+	if d, err := strconv.Atoi(deltaF); err == nil {
+		r.Delta, r.DeltaKnown = d, true
+	}
+	// deltaF == "?" (or any non-integer) leaves DeltaKnown false: unknowable.
 }
 
 // readLog returns every parseable revision of relPath, oldest first.
@@ -298,7 +469,7 @@ func (s *FS) Restore(relPath string, ts int64) (int64, error) {
 	if err := s.record(relPath, LabelPreRestore); err != nil {
 		return 0, fmt.Errorf("pre-restore safeguard failed, aborting: %w", err)
 	}
-	preTs, _ := s.lastRevision(relPath)
+	pre, _ := s.lastRevision(relPath) // the safeguard becomes this restore's predecessor
 
 	// 2. Read the requested revision.
 	revs, err := s.readLog(relPath)
@@ -323,10 +494,10 @@ func (s *FS) Restore(relPath string, ts int64) (int64, error) {
 		if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
 			return 0, err
 		}
-		if err := s.appendLog(relPath, LabelRestore, target.Hash); err != nil {
+		if err := s.appendLog(relPath, LabelRestore, target.Hash, computeSig(nil, pre, true)); err != nil {
 			return 0, err
 		}
-		return preTs.Timestamp, nil
+		return pre.Timestamp, nil
 	}
 
 	content, err := os.ReadFile(s.objectPath(target.Hash))
@@ -358,10 +529,10 @@ func (s *FS) Restore(relPath string, ts int64) (int64, error) {
 	}
 
 	// 4. Mark the restore in the log.
-	if err := s.appendLog(relPath, LabelRestore, target.Hash); err != nil {
+	if err := s.appendLog(relPath, LabelRestore, target.Hash, computeSig(content, pre, true)); err != nil {
 		return 0, err
 	}
-	return preTs.Timestamp, nil
+	return pre.Timestamp, nil
 }
 
 // TrackedUnder returns the relPaths of files the store already has history for
@@ -510,7 +681,7 @@ func (s *FS) rewriteLog(relPath string, kept []Revision) error {
 	}
 	var b strings.Builder
 	for _, r := range kept {
-		fmt.Fprintf(&b, "%d\t%s\t%s\n", r.Timestamp, r.Hash, r.Label)
+		b.WriteString(formatLine(r)) // preserves each revision's signal (or its absence)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(lp), ".tmp-log-*")
 	if err != nil {

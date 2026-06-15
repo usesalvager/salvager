@@ -95,10 +95,21 @@ Readable without the tool — `ls` and `cat` recover anything by hand:
 ```
 .lochis/
 ├── objects/<sha256>          full content, deduplicated by hash
-└── index/<relpath>.log       one line per revision: <unix_ms>\t<sha256>\t<label>
+└── index/<relpath>.log       one line per revision (tab-separated):
+                              <unix_ms>\t<sha256>\t<label>\t<lines>\t<bytes>\t<delta>\t<start-signature>
 ```
 
-Labels: `initial` · `modify` · `delete` · `pre-restore` · `restore`.
+Each line carries a content signal computed once at capture — total `<lines>`
+and `<bytes>`, the signed line `<delta>` vs the previous revision (`?` when that
+revision predates the signal), and a Go-quoted start signature (first non-empty
+lines). It lets `history` and the MCP `list_versions` tool say which revision
+holds a given block of work without re-reading any object. Legacy lines written
+before the signal keep the older three-column form (`<unix_ms>\t<sha256>\t<label>`)
+and are shown as "signal unavailable".
+
+Labels: `first-seen` · `modify` · `delete` · `pre-restore` · `restore`.
+(`first-seen` is the first captured revision — it already holds work, it is not
+an empty baseline.)
 
 ## What's ignored
 
