@@ -7,6 +7,14 @@ revisions automatically; when an agent (or a human) breaks something, you
 recover it with one command. Designed to be consumed by the agent itself over
 MCP, so it can self-repair.
 
+## Why
+
+An AI agent rewrites a file, deletes work you hadn't committed, or clobbers an
+uncommitted change — and `git` can't bring it back, because it was never staged.
+Salvager can: it has been quietly saving a revision of that file every time it
+changed, so you `restore` it in one command. No commits, no checkpoints, no
+configuration — just a running watcher and a recoverable history.
+
 ## Build
 
 ```sh
@@ -25,7 +33,7 @@ CGO_ENABLED=0 go build -ldflags "-X 'github.com/usesalvager/salvager/version.Ver
 The same value backs both `salvager --version` and the version the MCP server
 advertises to clients — one source of truth (`version.Version`).
 
-## Usage
+## Quickstart
 
 ```
 salvager watch [--allow-partial]  start the watcher (runs until killed)
@@ -40,43 +48,9 @@ Run `salvager watch` in the root of any project — zero configuration. It recor
 an initial revision of every tracked file on startup, then captures every
 change (debounced ~300 ms) thereafter.
 
-Each capture **streams** the file through a fixed buffer, so resident memory
-stays flat regardless of file size — a multi-hundred-MB dataset is captured
-without a memory spike. By design there is **no size cap that excludes content**:
-the watcher captures everything (a silent content hole would contradict the
-guarantee), and disk is bounded by retention instead.
-
-## Coverage on large trees (always whole)
-
-Every OS real-time watch has a ceiling: macOS/BSD `kqueue` spends one file
-descriptor per watched entry (`kern.maxfilesperproc`), and Linux `inotify`
-spends one watch per directory (`fs.inotify.max_user_watches`). A tree large
-enough to exhaust that ceiling — ~200k files hits the macOS default — would
-otherwise leave the overflow directories unwatched: their files get an initial
-snapshot and then **silently freeze**, never recording another edit.
-
-Salvager closes that gap automatically. Any directory the kernel refuses to watch
-in real time is handed to a **polling sweep** instead: a periodic
-stat-based (mtime+size) reconciliation that re-enumerates the overflow subtree,
-captures new files and edits, and lets content-hash dedup absorb the rest.
-Coverage is "part real-time, part polling" and always the whole tree. This is
-**automatic and silent** — no banner, no flag, no action required. The sweep is
-near-zero disk I/O when idle (pure metadata) and backs off with the work it
-finds, so it stays light even on a 200k-file tree.
-
-`--allow-partial` is the one escape hatch. If polling is ever unavailable to
-cover a real-time shortfall, Salvager **refuses to start** rather than run with
-silent gaps — unless you pass `--allow-partial`, which means "I knowingly run
-without full coverage." Partial coverage is only ever reachable by that explicit
-choice; it is never the default and never silent.
-
-Timestamps printed by `history` are human-readable; the raw millisecond values
-(needed for `show`/`restore`) are listed underneath.
-
-## How it recovers
-
-`restore` never destroys: before overwriting the file it saves the current
-on-disk state as a `pre-restore` revision, so any restore is itself reversible.
+When something goes wrong, recover it. `restore` never destroys: before
+overwriting the file it saves the current on-disk state as a `pre-restore`
+revision, so any restore is itself reversible.
 
 ```
 salvager history config.json          # find the good version
@@ -84,6 +58,12 @@ salvager show config.json 1718312445  # inspect it
 salvager restore config.json 1718312445
 # → prints the pre-restore timestamp to undo if needed
 ```
+
+Timestamps printed by `history` are human-readable; the raw millisecond values
+(needed for `show`/`restore`) are listed underneath.
+
+`salvager gc` drops revisions older than N days (default 7) and garbage-collects
+any object no longer referenced by any log. Run it manually or once a day.
 
 ## MCP
 
@@ -94,13 +74,9 @@ salvager restore config.json 1718312445
 - `salvager_restore` — restore a version (returns the pre-restore timestamp)
 
 No purge or delete is exposed over MCP — the safety net can't be erased by the
-agent that might break things.
-
-Every tool is contained to the project root: a `file` argument that escapes the
-tree (`../`, an absolute path, or empty) is refused with a structured error
-before any read, write, or delete — the MCP can never reach a file outside the
-watched project. `list_versions` on a file with no history is a success, not an
-error: it returns `tracked: false` with an empty `versions` list.
+agent that might break things. Every tool is also contained to the project root:
+a `file` argument that escapes the tree is refused before any read or write (see
+[architecture](docs/architecture.md#mcp-path-containment)).
 
 Register it with an MCP client (e.g. Claude Code):
 
@@ -112,96 +88,46 @@ Register it with an MCP client (e.g. Claude Code):
 }
 ```
 
-## Data layout (`.salvager/`)
+## How it works
 
-Readable without the tool — `ls` and `cat` recover anything by hand:
+The watcher captures each file by **streaming** it through a fixed buffer, so
+resident memory stays flat regardless of file size and there is no size cap that
+excludes content. Revisions are content-addressed and deduplicated by SHA-256 in
+a plain `.salvager/` tree you can read with `ls` and `cat`.
 
-```
-.salvager/
-├── objects/<sha256>          full content, deduplicated by hash
-└── index/<relpath>.log       one line per revision (tab-separated):
-                              <unix_ms>\t<sha256>\t<label>\t<lines>\t<bytes>\t<delta>\t<start-signature>
-```
+→ Full detail: [docs/architecture.md](docs/architecture.md) (capture model,
+data layout, dedup, what's ignored, rename/symlink handling, retention).
 
-Each line carries a content signal computed once at capture — total `<lines>`
-and `<bytes>`, the signed line `<delta>` vs the previous revision (`?` when that
-revision predates the signal), and a Go-quoted start signature (first non-empty
-lines). It lets `history` and the MCP `list_versions` tool say which revision
-holds a given block of work without re-reading any object. Legacy lines written
-before the signal keep the older three-column form (`<unix_ms>\t<sha256>\t<label>`)
-and are shown as "signal unavailable".
+## Coverage on large trees
 
-Labels: `first-seen` · `modify` · `delete` · `pre-restore` · `restore`.
-(`first-seen` is the first captured revision — it already holds work, it is not
-an empty baseline.)
+Every OS real-time watch has a ceiling (`kqueue` fds, `inotify` watches). Any
+directory the kernel won't watch in real time is handed to an automatic
+**polling sweep** instead — coverage is "part real-time, part polling" and
+always the whole tree, with no flag or action required. `--allow-partial` is the
+one explicit opt-out; without it, Salvager refuses to start rather than run with
+silent gaps.
 
-## What's ignored
+→ Full detail: [docs/coverage.md](docs/coverage.md).
 
-The project's `.gitignore` plus always-on defaults: `.git`, `.salvager`,
-`node_modules`, `vendor`, `.venv`, `__pycache__`, `target`, `dist`, `build`.
+## Limitations
 
-Transient editor artifacts are ignored too — swap, autosave, lock and backup
-files (`*.swp`, `*~`, `.#*`, `#*#`, `4913`, `.goutputstream-*`, `.~lock.*#`).
-The common atomic save (write a temp file, rename it over the target) is
-captured cleanly with no junk history; these patterns additionally suppress the
-long-lived temps (e.g. vim's `.swp` open for a whole session).
+A few things to know: large single-line files (minified JSON/CSV) get a
+less-distinctive at-a-glance signal but are always fully recoverable; overflow
+subtrees under polling detect changes on the next sweep, not instantly; and on
+coarse-timestamp filesystems (some NFS, FAT) the polling path can miss two
+same-size writes within one tick until the next change. None affect the hash or
+recoverability on the real-time path.
 
-Symlinks are never followed — a link could point outside the project or form a
-loop, so its path is skipped. An in-project file that a link points to is still
-versioned under its own real path, so nothing is lost.
+→ Full known-limits (including the two V2 residuals — racy-gate clock-mixing on
+cross-host NFS and the single-line signature edge): [docs/limitations.md](docs/limitations.md).
 
-Renaming a file is recorded as a delete of the old path plus a fresh history at
-the new path — history is **not** transferred to the new path, but it stays
-fully recoverable under the old one (`salvager history old.txt` / `restore`).
+## Performance
 
-## Retention
+Measured, not asserted: idle CPU under 0.1% of a core, save→queryable p50 ≈
+350 ms, whole-tree coverage until the OS watch ceiling — all backed by a
+reproducible external harness in `bench/`, not patched into the watcher.
 
-`salvager gc` drops revisions older than N days (default 7) and garbage-collects
-any object no longer referenced by any log. Run it manually or once a day.
-
-## Performance (measured)
-
-The claims above — featherweight to leave running, whole-tree coverage until the
-OS watch ceiling — are backed by a reproducible, external harness, not asserted.
-Nothing in `bench/` patches the watcher; every figure is observed the way an
-operator would see it (process CPU time, kernel watch/fd counts, save→queryable
-latency). Method and honesty conditions: `bench/PROTOCOL.md`.
-
-```sh
-(cd .. && go build -o salvager .)   # build the binary the harness exercises
-bench/run.sh                      # one tree → bench/RESULTS.md
-bench/sweep.sh                    # 20k / 100k / 200k → bench/SCALING.md
-go test ./store -bench=. -benchmem -run=^$   # store per-revision cost, no fs events
-```
-
-Scaling sweep on an Apple M2 Pro (`go1.25.0`, `kern.maxfilesperproc=122880`),
-unique content per file so the store never deduplicates (a floor on speed,
-ceiling on work — real repos capture faster):
-
-| Files / dirs | Cold capture | RSS idle | CPU idle | Save→queryable p50/p95 | Live watch coverage |
-|---|---|---|---|---|---|
-| 20k / 2k | 8.7 s (2310 files/s) | 28 MB | 0.10% of a core | 357 / 426 ms | 100% |
-| 100k / 10k | 72 s (1381 files/s) | 73 MB | 0.07% of a core | 365 / 451 ms | 100% |
-| 200k / 20k | 316 s | 49 MB | 0.07% of a core | — | **55.8%** |
-
-Read three things off this:
-
-- **Idle CPU is ~zero.** Quiescent, the watcher burns well under 0.1% of one
-  core at every size — the only scheduled work is the 100 ms debounce ticker.
-- **Latency is debounce-bound, not overhead.** p50 ≈ 350 ms is the intentional
-  ~300 ms write-burst debounce plus one ≤100 ms tick; it does not grow with the
-  tree.
-- **macOS coverage is fd-bound, and the sweep shows exactly where.** At 200k
-  files the per-process fd cap is exhausted (`kern.maxfilesperproc=122880`,
-  129 watch-add failures), so live-watch coverage drops to 55.8% — the overflow
-  subtrees fall to the polling sweep automatically (see "Coverage on large
-  trees"), still whole, just not real-time. Raising the sysctl keeps more of the
-  tree on the lower-latency path. Linux counts watches per *directory*, so file
-  count barely moves the ceiling there.
-
-Numbers are comparative on the host in the stamp, not a universal claim — publish
-the host line with any table. See `bench/RESULTS.md` and `bench/SCALING.md` for
-the full stamped output.
+→ Tables, scaling sweep, and how to run it: [docs/performance.md](docs/performance.md).
 
 ## Scope (v1)
 
@@ -213,46 +139,7 @@ age-based retention, external lightness/scaling benchmark harness (`bench/`).
 Out: branches, merge, sync, cloud, accounts, config files, web UI, RBAC,
 rendered diffs, explicit checkpoints, size-based retention.
 
-## Known limits (v1)
+## License
 
-- **Large files**: capture streams the file through a fixed buffer, so resident
-  memory is O(buffer) regardless of file size — hundreds of MB no longer spike
-  memory. There is **no size cap that excludes content** (deliberate: a silent
-  hole would break the guarantee); disk is bounded by retention instead. One
-  edge: the start signature is computed from the first 64 KiB, so a long
-  single-line file (minified JSON, a one-row CSV) gets a less-distinctive
-  signature — this never affects the hash or recoverability, only the
-  at-a-glance signal.
-- **Real-time watch limit (macOS/Linux)**: each directory (kqueue: each entry)
-  consumes a kernel resource. When the cap (`kern.maxfilesperproc` /
-  `fs.inotify.max_user_watches`) is reached, the affected subtrees fall back to
-  the polling sweep automatically — coverage stays whole (see "Coverage on large
-  trees"). Raising the sysctl keeps more of the tree on the lower-latency
-  real-time path, but is no longer required for correctness.
-- **Polling latency / CPU at extreme scale**: overflow files are detected on the
-  next sweep, not instantly, and a very large overflow region (tens of thousands
-  of polled files) costs ~1.7 s of `lstat` per pass on an M2 (near-zero disk
-  I/O). The sweep backs off to keep that under ~10% of a core. A directory-level
-  recursive backend (macOS FSEvents) would remove the scan entirely; it is
-  deferred — the cgo dependency and loss of the static binary are not justified
-  by the measured disk cost, only by this CPU cost, which has not yet proven
-  painful in practice.
-- **Coarse-timestamp / NFS polling residual**: the polling fallback detects
-  changes by stat (mtime+ctime+size). On a filesystem with ≥1s timestamp
-  resolution — some NFS mounts (e.g. NFSv3), FAT — two same-size in-place writes
-  to one file within a single tick can be missed until the next stat-moving
-  change. This only applies to overflow subtrees under polling (not the
-  real-time path) and self-heals on the next change; nanosecond-resolution
-  filesystems (ext4/overlay in typical Linux containers, APFS) are unaffected.
-  Relevant mainly to NFS-backed working trees on the cloud path. The real-time
-  path has its own stat shortcut (skip re-streaming an unchanged file) gated by a
-  conservative racy window — widened automatically on coarse-timestamp
-  filesystems — that **fails toward capture**, so it never drops a change. On
-  cross-host NFS, comparing the gate's wall clock against the server's mtime can
-  distort that window and trigger redundant re-captures, never a miss.
-- **Symlinks** are skipped, not followed (see above).
-- **Long-running**: no known leak of memory or file descriptors. Exercised by an
-  opt-in soak test (`SALVAGER_SOAK=<duration> go test ./watch -run TestSoakNoLeak`):
-  under sustained rewrite load — including large-file re-streams and same-size
-  in-place rewrites — goroutine and file-descriptor counts return to baseline,
-  with no per-capture leak in the streaming open/temp/rename path.
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Copyright 2026 Somhi Lagunak SL.
