@@ -30,6 +30,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -155,7 +156,7 @@ func (s *FS) Record(relPath string) error {
 // Caller holds s.mu.
 func (s *FS) record(relPath string, force Label) error {
 	abs := filepath.Join(s.root, relPath)
-	content, err := os.ReadFile(abs)
+	f, err := os.Open(abs)
 
 	last, hasLast := s.lastRevision(relPath)
 
@@ -163,7 +164,7 @@ func (s *FS) record(relPath string, force Label) error {
 		if !os.IsNotExist(err) {
 			return err
 		}
-		// File is gone from disk.
+		// File is gone from disk. (No content; same handling as before.)
 		if force != "" {
 			// Forced safeguard of an absent file: mark deletion explicitly.
 			h := ""
@@ -177,14 +178,22 @@ func (s *FS) record(relPath string, force Label) error {
 		}
 		return s.appendLog(relPath, LabelDelete, last.Hash, computeSig(nil, last, hasLast))
 	}
+	defer f.Close()
 
-	hash := sha256hex(content)
-	if force == "" && hasLast && last.Hash == hash && last.Label != LabelDelete {
-		return nil // unchanged: dedup, record nothing
+	// Stream the file once: object write, hash and content signal all computed
+	// in a single pass over a fixed buffer, so resident memory stays O(bufSize)
+	// regardless of file size. The object is content-addressed, so the hash —
+	// and thus the dedup decision — is only known after the whole stream is read.
+	hash, sig, err := s.captureStream(f, last, hasLast)
+	if err != nil {
+		return err
 	}
 
-	if err := s.writeObject(hash, content); err != nil {
-		return err
+	if force == "" && hasLast && last.Hash == hash && last.Label != LabelDelete {
+		// Unchanged: the streamed object was deduped away by existence; record
+		// nothing. Same observable result as before — now decided by the content
+		// hash over the full streamed bytes, never by a stat shortcut.
+		return nil
 	}
 
 	label := force
@@ -195,40 +204,138 @@ func (s *FS) record(relPath string, force Label) error {
 			label = LabelInitial
 		}
 	}
-	return s.appendLog(relPath, label, hash, computeSig(content, last, hasLast))
+	return s.appendLog(relPath, label, hash, sig)
 }
 
-// writeObject stores content at objects/<hash>, atomically, once. No-op if the
-// object already exists (content-addressed: same hash == same bytes).
-func (s *FS) writeObject(hash string, content []byte) error {
-	path := s.objectPath(hash)
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	}
+// bufSize is the fixed streaming buffer. Capture reads and hashes through a
+// buffer this size, so resident memory is O(bufSize) regardless of file size.
+// 128 KiB amortizes read syscalls on page-cache-warm reads; sha256 runs at GB/s
+// so capture is read-bound and throughput is flat past ~64-128 KiB. Captures are
+// serialized under s.mu, so only one buffer is ever live.
+const bufSize = 128 * 1024
+
+// sigScanLimit bounds how much of a file's head is retained to compute the start
+// signature. It is >= the 8192-byte binary-check window, and large enough that
+// any file whose first three non-empty lines end within it yields a signature
+// byte-identical to a whole-file scan. A file whose first three non-empty lines
+// fall beyond it — notably a long single-line file (minified JSON, a one-row
+// CSV, a one-line dataset) — gets a possibly-shorter signature. That never
+// affects the hash or dedup (both run over the full streamed bytes); it only
+// makes the human-facing signal less distinctive for those files.
+const sigScanLimit = 64 * 1024
+
+// captureStream reads src exactly once, writing its bytes to a temp object while
+// feeding the same bytes to the hasher, the line/byte counter and a bounded
+// prefix retained for the start signature. On success the content lives at
+// objects/<hash> — renamed from the temp, or the temp discarded when the object
+// already exists (dedup by existence) — and the content signal is returned.
+//
+// Atomicity (temp + rename) and dedup-by-existence are preserved from the
+// previous byte-slice writeObject; the only change is that the existence check
+// happens after the hash is known, because the object path is the hash. A single
+// pass over one buffer also closes the TOCTOU a two-pass (hash, then re-read to
+// copy) design would open: the object bytes and their content-address come from
+// the very same byte stream.
+// captureStream takes ownership of closing src: it releases the source fd the
+// instant its single read completes, before the object is placed, so a Stat or
+// Rename failure during placement can never hold the source open. The caller may
+// still keep a deferred Close as a belt — os.File.Close is safe to call twice.
+func (s *FS) captureStream(src io.ReadCloser, last Revision, hasLast bool) (string, revSig, error) {
 	if err := os.MkdirAll(s.objectsDir(), 0o755); err != nil {
-		return err
+		return "", revSig{}, err
 	}
 	tmp, err := os.CreateTemp(s.objectsDir(), ".tmp-*")
 	if err != nil {
-		return err
+		return "", revSig{}, err
 	}
 	tmpName := tmp.Name()
-	// On any failure below, best-effort remove the temp; the returned error is
-	// the real cause, so a failed cleanup must not mask it.
-	if _, err := tmp.Write(content); err != nil {
-		tmp.Close()
+
+	h := sha256.New()
+	ctr := &lineByteCounter{}
+	pre := &prefixSink{limit: sigScanLimit}
+	buf := make([]byte, bufSize)
+
+	// One pass: every byte goes to the object, the hasher, the counter and the
+	// prefix at once. Only the temp write can fail; the other sinks never error.
+	_, copyErr := io.CopyBuffer(io.MultiWriter(tmp, h, ctr, pre), src, buf)
+	// Release the source fd now — its single read is done — and the temp fd, both
+	// before placement. src close errors are not actionable here: the bytes were
+	// already fully read and hashed, so a cosmetic read-fd close failure must not
+	// discard a valid capture; the deferred close in the caller is the belt.
+	_ = src.Close()
+	closeErr := tmp.Close()
+	// On any failure, best-effort remove the temp; the returned error is the real
+	// cause, so a failed cleanup must not mask it.
+	if copyErr != nil {
 		_ = os.Remove(tmpName)
-		return err
+		return "", revSig{}, copyErr
 	}
-	if err := tmp.Close(); err != nil {
+	if closeErr != nil {
 		_ = os.Remove(tmpName)
-		return err
+		return "", revSig{}, closeErr
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+
+	hash := hex.EncodeToString(h.Sum(nil))
+	path := s.objectPath(hash)
+	if _, statErr := os.Stat(path); statErr == nil {
+		_ = os.Remove(tmpName) // object already present: content-addressed, identical bytes
+	} else if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
-		return err
+		return "", revSig{}, err
 	}
-	return nil
+
+	return hash, computeSigFromStream(ctr, pre, last, hasLast), nil
+}
+
+// lineByteCounter tallies bytes and newline-delimited lines as content streams
+// through it, applying the same final-unterminated-line rule as lineCount so a
+// signal computed from a stream equals the one computed from the whole slice.
+type lineByteCounter struct {
+	total    int64
+	newlines int
+	lastByte byte
+	wrote    bool
+}
+
+func (c *lineByteCounter) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		c.total += int64(len(p))
+		c.newlines += bytes.Count(p, []byte{'\n'})
+		c.lastByte = p[len(p)-1]
+		c.wrote = true
+	}
+	return len(p), nil
+}
+
+// lines mirrors lineCount: empty content is 0 lines; otherwise count newlines and
+// add one for a final unterminated line.
+func (c *lineByteCounter) lines() int {
+	if !c.wrote || c.total == 0 {
+		return 0
+	}
+	n := c.newlines
+	if c.lastByte != '\n' {
+		n++
+	}
+	return n
+}
+
+// prefixSink retains the first limit bytes of a stream and discards the rest, so
+// the start signature can be computed from the head without buffering the whole
+// file (keeping capture O(bufSize) memory even for a huge single-line file).
+type prefixSink struct {
+	buf   []byte
+	limit int
+}
+
+func (p *prefixSink) Write(b []byte) (int, error) {
+	if room := p.limit - len(p.buf); room > 0 {
+		if room > len(b) {
+			room = len(b)
+		}
+		p.buf = append(p.buf, b[:room]...)
+	}
+	return len(b), nil
 }
 
 // revSig is the content signal for one revision, computed at capture from the
@@ -250,15 +357,33 @@ type revSig struct {
 func computeSig(content []byte, last Revision, hasLast bool) revSig {
 	n := lineCount(content)
 	rs := revSig{lines: n, bytes: len(content), sig: startSignature(content)}
+	rs.delta, rs.deltaKnown = deltaFor(n, last, hasLast)
+	return rs
+}
+
+// computeSigFromStream builds the same signal as computeSig, but from the
+// streamed counters and retained head prefix instead of a full byte slice, so
+// the streaming capture path and the byte-slice path produce identical signals.
+func computeSigFromStream(ctr *lineByteCounter, pre *prefixSink, last Revision, hasLast bool) revSig {
+	n := ctr.lines()
+	rs := revSig{lines: n, bytes: int(ctr.total), sig: startSignature(pre.buf)}
+	rs.delta, rs.deltaKnown = deltaFor(n, last, hasLast)
+	return rs
+}
+
+// deltaFor computes the signed line delta vs the previous revision and whether it
+// is knowable. The first revision counts every line as added; a previous
+// revision that predates the signal leaves the delta unknowable rather than
+// guessed. Shared by both signal paths so they cannot drift.
+func deltaFor(n int, last Revision, hasLast bool) (int, bool) {
 	switch {
 	case !hasLast:
-		rs.delta, rs.deltaKnown = n, true // first revision: all lines are new
+		return n, true // first revision: all lines are new
 	case last.HasSignal:
-		rs.delta, rs.deltaKnown = n-last.Lines, true
+		return n - last.Lines, true
 	default:
-		rs.deltaKnown = false // previous revision has no signal to diff against
+		return 0, false // previous revision has no signal to diff against
 	}
-	return rs
 }
 
 // lineCount counts newline-delimited lines, counting a final unterminated line.
