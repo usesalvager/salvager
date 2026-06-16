@@ -43,6 +43,13 @@ type versionInfo struct {
 }
 
 type listOutput struct {
+	// File echoes the queried path and Tracked says whether any history exists
+	// for it. An empty Versions list is a success, not an error (a file simply
+	// has no recorded history yet); Tracked makes that explicit so an agent can
+	// tell "no history" apart from a failed call without inferring it from an
+	// empty array.
+	File     string        `json:"file"`
+	Tracked  bool          `json:"tracked"`
 	Versions []versionInfo `json:"versions"`
 }
 
@@ -97,7 +104,11 @@ func NewServer(b Backend) *mcp.Server {
 		if err != nil {
 			return nil, listOutput{}, err
 		}
-		out := listOutput{Versions: make([]versionInfo, 0, len(revs))}
+		out := listOutput{
+			File:     in.File,
+			Tracked:  len(revs) > 0,
+			Versions: make([]versionInfo, 0, len(revs)),
+		}
 		for _, r := range revs {
 			vi := versionInfo{
 				TimestampHuman: human(r.Timestamp),

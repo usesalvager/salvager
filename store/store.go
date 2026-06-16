@@ -29,6 +29,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -41,6 +42,27 @@ import (
 
 // Dir is the name of the history directory created inside a project root.
 const Dir = ".salvager"
+
+// ErrUnsafePath is returned when a caller-supplied relPath would escape the
+// project root. The store is the safety net for one project's working tree; it
+// must never read, write, or delete outside that tree. Containment lives here,
+// at the lowest shared chokepoint, so every entry point (MCP tools, CLI, the
+// watcher) is protected by one rule rather than each guarding itself.
+var ErrUnsafePath = errors.New("path escapes project root")
+
+// safeRel rejects any relPath that is not a clean path contained within the
+// root. filepath.IsLocal accepts ordinary relative paths including
+// subdirectories ("a/b/c.txt") and inner ".." that still stays inside
+// ("a/../b"), while rejecting real escapes ("../x", "a/../../x"), absolute
+// paths, volume-prefixed paths, and the empty string. The empty string
+// rejection is deliberate: a missing/zero-value "file" argument is an unsafe
+// path, not a request for some default file.
+func safeRel(relPath string) error {
+	if !filepath.IsLocal(relPath) {
+		return fmt.Errorf("%w: %q", ErrUnsafePath, relPath)
+	}
+	return nil
+}
 
 // Label classifies why a revision was recorded.
 type Label string
@@ -146,6 +168,9 @@ func sha256hex(b []byte) string {
 // recorded revision. Deduplicated by content hash. A missing file is recorded
 // as a delete (no new object).
 func (s *FS) Record(relPath string) error {
+	if err := safeRel(relPath); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.record(relPath, "")
@@ -556,6 +581,9 @@ func (s *FS) lastRevision(relPath string) (Revision, bool) {
 
 // List returns the revisions of relPath, most recent first.
 func (s *FS) List(relPath string) ([]Revision, error) {
+	if err := safeRel(relPath); err != nil {
+		return nil, err
+	}
 	revs, err := s.readLog(relPath)
 	if err != nil {
 		return nil, err
@@ -569,6 +597,9 @@ func (s *FS) List(relPath string) ([]Revision, error) {
 
 // Get returns the content of the revision of relPath taken at ts.
 func (s *FS) Get(relPath string, ts int64) ([]byte, error) {
+	if err := safeRel(relPath); err != nil {
+		return nil, err
+	}
 	revs, err := s.readLog(relPath)
 	if err != nil {
 		return nil, err
@@ -589,6 +620,16 @@ func (s *FS) Get(relPath string, ts int64) ([]byte, error) {
 // is itself reversible. Strict order; if the safeguard fails, the working tree
 // is left untouched. Returns the safeguard's timestamp.
 func (s *FS) Restore(relPath string, ts int64) (int64, error) {
+	// Containment is checked before ANY effect — in particular before the step-1
+	// pre-restore safeguard, which would otherwise read a foreign file's bytes
+	// into objects/ (an information leak) before the destructive branches even
+	// run. For a traversal path the most dangerous branch is the deletion case
+	// below (os.Remove of an arbitrary host path, with no pre-restore possible);
+	// rejecting here means neither the overwrite nor the delete branch is reached.
+	if err := safeRel(relPath); err != nil {
+		return 0, err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
