@@ -48,7 +48,8 @@ brew install usesalvager/tap/salvager
 go build -o salvager .
 ```
 
-Single static binary, no runtime. macOS and Linux supported; Windows best-effort.
+Single static binary, no runtime. macOS and Linux supported; Windows is
+build-from-source best-effort (no prebuilt binary).
 
 A plain build reports its version as `dev` (`salvager --version` → `salvager dev`).
 For a release, inject the version via ldflags:
@@ -68,7 +69,7 @@ salvager history <file>           list recorded versions of a file
 salvager show <file> <ts>         print the content of one version
 salvager restore <file> <ts>      restore a file to a version (reversible)
 salvager mcp                      start the MCP server (stdio)
-salvager gc [--max-age 7d]        purge revisions older than the threshold
+salvager gc [--max-age 7d] [--max-bytes 500M]  purge old revisions and cap store size
 ```
 
 Run `salvager watch` in the root of any project — zero configuration. It records
@@ -90,7 +91,11 @@ Timestamps printed by `history` are human-readable; the raw millisecond values
 (needed for `show`/`restore`) are listed underneath.
 
 `salvager gc` drops revisions older than N days (default 7) and garbage-collects
-any object no longer referenced by any log. Run it manually or once a day.
+any object no longer referenced by any log. With `--max-bytes`, it also caps
+store size: when the store exceeds the budget it evicts the oldest revisions
+first until it's back under the limit, always keeping each file's most recent
+revision and never breaking a restore's reversibility. Run it manually or once a
+day.
 
 ## MCP
 
@@ -161,10 +166,11 @@ reproducible external harness in `bench/`, not patched into the watcher.
 In: watcher, per-file store, list/get/restore/record, pre-restore safeguard,
 polling sweep for over-cap subtrees (automatic full coverage) + `--allow-partial`
 degradation policy, `.gitignore` + default excludes, CLI, MCP (3 tools),
-age-based retention, external lightness/scaling benchmark harness (`bench/`).
+age- and size-based retention (always keeps each file's latest revision, never
+breaks a restore), external lightness/scaling benchmark harness (`bench/`).
 
 Out: branches, merge, sync, cloud, accounts, config files, web UI, RBAC,
-rendered diffs, explicit checkpoints, size-based retention.
+rendered diffs, explicit checkpoints.
 
 ## License
 
