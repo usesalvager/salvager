@@ -40,6 +40,12 @@ Run `salvager watch` in the root of any project — zero configuration. It recor
 an initial revision of every tracked file on startup, then captures every
 change (debounced ~300 ms) thereafter.
 
+Each capture **streams** the file through a fixed buffer, so resident memory
+stays flat regardless of file size — a multi-hundred-MB dataset is captured
+without a memory spike. By design there is **no size cap that excludes content**:
+the watcher captures everything (a silent content hole would contradict the
+guarantee), and disk is bounded by retention instead.
+
 ## Coverage on large trees (always whole)
 
 Every OS real-time watch has a ceiling: macOS/BSD `kqueue` spends one file
@@ -203,9 +209,14 @@ rendered diffs, explicit checkpoints, size-based retention.
 
 ## Known limits (v1)
 
-- **Large files** are read whole into memory on each capture — no streaming hash
-  and no size cap. Multi-MB files are fine; files of hundreds of MB cause a
-  memory spike per capture. (A documented size limit/skip is a candidate for v2.)
+- **Large files**: capture streams the file through a fixed buffer, so resident
+  memory is O(buffer) regardless of file size — hundreds of MB no longer spike
+  memory. There is **no size cap that excludes content** (deliberate: a silent
+  hole would break the guarantee); disk is bounded by retention instead. One
+  edge: the start signature is computed from the first 64 KiB, so a long
+  single-line file (minified JSON, a one-row CSV) gets a less-distinctive
+  signature — this never affects the hash or recoverability, only the
+  at-a-glance signal.
 - **Real-time watch limit (macOS/Linux)**: each directory (kqueue: each entry)
   consumes a kernel resource. When the cap (`kern.maxfilesperproc` /
   `fs.inotify.max_user_watches`) is reached, the affected subtrees fall back to
@@ -227,7 +238,15 @@ rendered diffs, explicit checkpoints, size-based retention.
   change. This only applies to overflow subtrees under polling (not the
   real-time path) and self-heals on the next change; nanosecond-resolution
   filesystems (ext4/overlay in typical Linux containers, APFS) are unaffected.
-  Relevant mainly to NFS-backed working trees on the cloud path.
+  Relevant mainly to NFS-backed working trees on the cloud path. The real-time
+  path has its own stat shortcut (skip re-streaming an unchanged file) gated by a
+  conservative racy window — widened automatically on coarse-timestamp
+  filesystems — that **fails toward capture**, so it never drops a change. On
+  cross-host NFS, comparing the gate's wall clock against the server's mtime can
+  distort that window and trigger redundant re-captures, never a miss.
 - **Symlinks** are skipped, not followed (see above).
-- **Long-running**: no known leak of memory or file descriptors; not yet
-  validated by a multi-hour soak test.
+- **Long-running**: no known leak of memory or file descriptors. Exercised by an
+  opt-in soak test (`SALVAGER_SOAK=<duration> go test ./watch -run TestSoakNoLeak`):
+  under sustained rewrite load — including large-file re-streams and same-size
+  in-place rewrites — goroutine and file-descriptor counts return to baseline,
+  with no per-capture leak in the streaming open/temp/rename path.
