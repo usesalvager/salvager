@@ -662,3 +662,35 @@ func TestE2E_A10_2_RecoverUncommittedWorkGitCannot(t *testing.T) {
 		t.Fatalf("restore did not bring the work back byte-for-byte\n got=%q\nwant=%q", restored, good)
 	}
 }
+
+func TestParseMaxBytes(t *testing.T) {
+	ok := []struct {
+		in   string
+		want int64
+	}{
+		{"0", 0},
+		{"500", 500},
+		{"1K", 1 << 10},
+		{"1k", 1 << 10},
+		{"500M", 500 << 20},
+		{"2G", 2 << 30},
+		{" 8M ", 8 << 20}, // surrounding space tolerated
+	}
+	for _, c := range ok {
+		got, err := parseMaxBytes(c.in)
+		if err != nil {
+			t.Errorf("parseMaxBytes(%q): unexpected error %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parseMaxBytes(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+
+	bad := []string{"", "  ", "M", "-5", "-5M", "1.5M", "K1", "12X", "0x10"}
+	for _, in := range bad {
+		if _, err := parseMaxBytes(in); err == nil {
+			t.Errorf("parseMaxBytes(%q): want error, got nil", in)
+		}
+	}
+}

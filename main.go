@@ -5,7 +5,8 @@
 //	salvager show <file> <ts>         print the content of one version
 //	salvager restore <file> <ts>      restore a file to a version (reversible)
 //	salvager mcp                      start the MCP server (stdio)
-//	salvager gc [--max-age 7d]        purge revisions older than the threshold
+//	salvager gc [--max-age 7d] [--max-bytes 500M]
+//	                                  purge old revisions and cap store size
 package main
 
 import (
@@ -37,7 +38,8 @@ Usage:
   salvager show <file> <timestamp>  print the content of one version
   salvager restore <file> <ts>      restore a file to a version (reversible)
   salvager mcp                      start the MCP server (stdio)
-  salvager gc [--max-age 7d]        purge revisions older than the threshold
+  salvager gc [--max-age 7d] [--max-bytes 500M]
+                                    purge old revisions and cap store size
 `
 
 func main() {
@@ -191,23 +193,51 @@ func cmdMCP(root string) {
 
 func cmdGC(root string, args []string) {
 	maxAge := 7 * 24 * time.Hour
+	maxBytes := int64(-1) // -1 == flag absent: skip size GC, behave exactly as before
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--max-age" && i+1 < len(args) {
+		switch {
+		case args[i] == "--max-age" && i+1 < len(args):
 			d, err := parseMaxAge(args[i+1])
 			if err != nil {
 				fatal(err)
 			}
 			maxAge = d
 			i++
-		} else {
-			fatalf("usage: salvager gc [--max-age 7d]")
+		case args[i] == "--max-bytes" && i+1 < len(args):
+			b, err := parseMaxBytes(args[i+1])
+			if err != nil {
+				fatal(err)
+			}
+			maxBytes = b
+			i++
+		default:
+			fatalf("usage: salvager gc [--max-age 7d] [--max-bytes 500M]")
 		}
 	}
 	s := store.New(root)
+
+	// Compose age then size: prune by age first, then cap whatever survives.
 	if err := s.GC(maxAge); err != nil {
 		fatal(err)
 	}
 	fmt.Printf("gc: purged revisions older than %s\n", maxAge)
+
+	if maxBytes < 0 {
+		return
+	}
+	finalBytes, err := s.GCBySize(maxBytes)
+	if err != nil {
+		fatal(err)
+	}
+	// Two legitimate, distinct endings — the user needs to know which happened.
+	if finalBytes <= maxBytes {
+		fmt.Printf("gc: store within size budget of %s (now %s)\n",
+			humanBytes(maxBytes), humanBytes(finalBytes))
+	} else {
+		fmt.Printf("gc: reached the P1/P2 floor at %s — cannot shrink below the %s budget "+
+			"without dropping a file's last revision or orphaning a restore\n",
+			humanBytes(finalBytes), humanBytes(maxBytes))
+	}
 }
 
 // rel makes a user-supplied path relative to root, accepting either an
@@ -232,6 +262,51 @@ func parseMaxAge(s string) (time.Duration, error) {
 		return time.Duration(n) * 24 * time.Hour, nil
 	}
 	return time.ParseDuration(s)
+}
+
+// parseMaxBytes parses a byte budget with optional binary suffix K/M/G
+// (KiB/MiB/GiB), consistent with the rest of the project reasoning in KiB. A
+// bare number is bytes. Stdlib only; no new dependency.
+func parseMaxBytes(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	mult := int64(1)
+	switch s[len(s)-1] {
+	case 'K', 'k':
+		mult = 1 << 10
+	case 'M', 'm':
+		mult = 1 << 20
+	case 'G', 'g':
+		mult = 1 << 30
+	}
+	num := s
+	if mult != 1 {
+		num = s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(num, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	if n > (1<<63-1)/mult {
+		return 0, fmt.Errorf("size %q overflows int64", s)
+	}
+	return n * mult, nil
+}
+
+// humanBytes renders a byte count with a binary suffix for the gc summary.
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1fG", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1fM", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1fK", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 func parseTS(s string) int64 {

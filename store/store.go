@@ -34,6 +34,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -120,6 +121,7 @@ type Store interface {
 	Get(relPath string, ts int64) ([]byte, error)
 	Restore(relPath string, ts int64) (preRestoreTs int64, err error)
 	GC(maxAge time.Duration) error
+	GCBySize(maxBytes int64) (finalBytes int64, err error)
 }
 
 // nowFunc is the clock; overridable in tests.
@@ -823,6 +825,17 @@ func (s *FS) GC(maxAge time.Duration) error {
 	}
 
 	// Delete objects nobody references anymore.
+	return s.sweepUnreferenced(referenced)
+}
+
+// sweepUnreferenced removes every object whose hash is absent from referenced
+// (the set of hashes still named by some surviving revision). It is the shared
+// object-collection sweep used by both GC (by age) and GCBySize (by size): an
+// object is freed if and only if no surviving revision of any log references it,
+// so the caller's `referenced` set is the implicit reference count. Skips the
+// in-flight capture temps (".tmp-*") and any nested dirs. A missing objects/ dir
+// is not an error (nothing was ever captured).
+func (s *FS) sweepUnreferenced(referenced map[string]struct{}) error {
 	entries, err := os.ReadDir(s.objectsDir())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -841,6 +854,188 @@ func (s *FS) GC(maxAge time.Duration) error {
 		}
 	}
 	return nil
+}
+
+// objectSize returns the on-disk size of the object named by hash, or 0 if it
+// cannot be stat'd (e.g. a referenced object missing from a corrupt store, which
+// must not abort a GC). Measuring by Stat — not Revision.Bytes — is deliberate:
+// the object is the physically freeable unit and is shared across revisions,
+// whereas Bytes is the per-revision content length and is absent on legacy lines.
+func (s *FS) objectSize(hash string) int64 {
+	fi, err := os.Stat(s.objectPath(hash))
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// evMember names one revision inside an eviction unit.
+type evMember struct {
+	relPath string
+	ts      int64
+	hash    string
+}
+
+// buildEvictionUnits returns the eviction units in global oldest-first order by
+// (timestamp, relPath). A unit is a slice of revisions evicted together: a single
+// revision, or an atomic pre-restore/restore pair. The pinning rules encode the
+// product's two safety invariants:
+//
+//	P1 — each file's newest revision (oldest-first: the last element) is pinned
+//	     and never appears in a unit, so no file is ever stripped of its last net.
+//	P2 — a pre-restore/restore pair (the restore is the pre-restore's immediate
+//	     successor; Restore writes them back-to-back under s.mu) is one atomic
+//	     unit. If that restore is itself the file's newest (pinned by P1), the pair
+//	     cannot be evicted, so the pre-restore is pinned by extension — evicting it
+//	     alone would orphan a live restore and make a recorded restore irreversible.
+func (s *FS) buildEvictionUnits(perFile map[string][]Revision) [][]evMember {
+	var units [][]evMember
+	for relPath, revs := range perFile {
+		newest := len(revs) - 1 // P1: the newest revision is pinned
+		for i := 0; i < newest; i++ {
+			r := revs[i]
+			if r.Label == LabelPreRestore && i+1 < len(revs) && revs[i+1].Label == LabelRestore {
+				if i+1 == newest {
+					// The restore is this file's newest (pinned): the pair cannot be
+					// evicted, so the pre-restore is pinned too. Both skipped.
+					continue
+				}
+				units = append(units, []evMember{
+					{relPath, r.Timestamp, r.Hash},
+					{relPath, revs[i+1].Timestamp, revs[i+1].Hash},
+				})
+				i++ // the restore is consumed into this atomic unit
+				continue
+			}
+			units = append(units, []evMember{{relPath, r.Timestamp, r.Hash}})
+		}
+	}
+	// Deterministic global order: by each unit's oldest member (its [0]), then
+	// relPath to break ties between files sharing a timestamp.
+	sort.Slice(units, func(a, b int) bool {
+		ua, ub := units[a][0], units[b][0]
+		if ua.ts != ub.ts {
+			return ua.ts < ub.ts
+		}
+		return ua.relPath < ub.relPath
+	})
+	return units
+}
+
+// GCBySize enforces a maximum total size on the object store, evicting the oldest
+// revisions until the referenced objects fit within maxBytes. It returns the
+// store's referenced size AFTER eviction so the caller can tell the two
+// legitimate outcomes apart:
+//
+//	finalBytes <= maxBytes  the budget was met.
+//	finalBytes >  maxBytes  the P1/P2 floor was reached — the store cannot shrink
+//	                        further without dropping a file's last net (P1) or
+//	                        orphaning a recorded restore (P2). NOT an error.
+//
+// Size is measured over OBJECTS (the only thing that occupies disk),
+// deduplicated by content hash: an object is freed only when its last
+// referencing revision is evicted, so a blob shared by two revisions survives
+// until both are gone. Eviction order is global oldest-first by (timestamp,
+// relPath). Composes after GC(maxAge): prune by age first, then cap what remains.
+func (s *FS) GCBySize(maxBytes int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	logs, err := s.allLogs()
+	if err != nil {
+		return 0, err
+	}
+
+	// Load every file's revisions (oldest-first) and build the implicit reference
+	// count: how many live revisions name each object hash, plus each object's
+	// on-disk size. Deletions (empty hash) reference no object. total is the
+	// deduped sum — each object counted once.
+	perFile := make(map[string][]Revision, len(logs))
+	refcount := map[string]int{}
+	size := map[string]int64{}
+	var total int64
+	for _, relPath := range logs {
+		revs, err := s.readLog(relPath)
+		if err != nil {
+			return 0, err
+		}
+		if len(revs) == 0 {
+			continue
+		}
+		perFile[relPath] = revs
+		for _, r := range revs {
+			if r.Hash == "" {
+				continue
+			}
+			if refcount[r.Hash] == 0 {
+				sz := s.objectSize(r.Hash)
+				size[r.Hash] = sz
+				total += sz
+			}
+			refcount[r.Hash]++
+		}
+	}
+
+	if total <= maxBytes {
+		return total, nil // already within budget: no-op
+	}
+
+	// Walk the eviction units oldest-first, decrementing the refcount as each
+	// revision is removed and subtracting an object's size the moment its last
+	// reference disappears. Pinned revisions (P1/P2) are absent from `units`, so
+	// the walk skips them; when units run out while still over budget, the floor
+	// has been reached.
+	removed := map[string]map[int64]bool{} // relPath -> set of removed timestamps
+	for _, u := range s.buildEvictionUnits(perFile) {
+		if total <= maxBytes {
+			break
+		}
+		for _, m := range u {
+			if refcount[m.hash] > 0 {
+				refcount[m.hash]--
+				if refcount[m.hash] == 0 {
+					total -= size[m.hash]
+				}
+			}
+			if removed[m.relPath] == nil {
+				removed[m.relPath] = map[int64]bool{}
+			}
+			removed[m.relPath][m.ts] = true
+		}
+	}
+
+	// Rewrite only the logs that lost revisions; `kept` is never empty because P1
+	// pins each file's newest revision. Collect the surviving hashes for the sweep.
+	referenced := map[string]struct{}{}
+	for relPath, revs := range perFile {
+		rm := removed[relPath]
+		if len(rm) == 0 {
+			for _, r := range revs {
+				if r.Hash != "" {
+					referenced[r.Hash] = struct{}{}
+				}
+			}
+			continue
+		}
+		kept := make([]Revision, 0, len(revs))
+		for _, r := range revs {
+			if rm[r.Timestamp] {
+				continue
+			}
+			kept = append(kept, r)
+			if r.Hash != "" {
+				referenced[r.Hash] = struct{}{}
+			}
+		}
+		if err := s.rewriteLog(relPath, kept); err != nil {
+			return total, err
+		}
+	}
+
+	if err := s.sweepUnreferenced(referenced); err != nil {
+		return total, err
+	}
+	return total, nil
 }
 
 // rewriteLog atomically replaces a log with kept (or removes it if empty).
