@@ -104,3 +104,114 @@ jobs:
             salvager-*-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  bump-tap:
+    name: Bump Homebrew tap
+    # After all binaries + checksums are attached, regenerate the formula in the
+    # tap repo with the new version and checksums and push it directly. This does
+    # NOT touch how binaries are built — it only consumes the checksums the
+    # release already produced. Skips cleanly if TAP_PUSH_TOKEN is unset.
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check token is configured
+        id: gate
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          if [ -z "${TAP_PUSH_TOKEN}" ]; then
+            echo "TAP_PUSH_TOKEN not set — skipping tap bump." >&2
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout tap repo
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: usesalvager/homebrew-tap
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+          path: tap
+
+      - name: Render formula
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eu
+          ver_no_v="${VERSION#v}"
+          base="https://github.com/usesalvager/salvager/releases/download/${VERSION}"
+
+          # Pull each checksum straight from the release we just published.
+          dl_sha() {
+            curl -fsSL "${base}/salvager-${VERSION}-$1.sha256" | awk '{print $1}'
+          }
+          darwin_arm="$(dl_sha darwin-arm64)"
+          darwin_amd="$(dl_sha darwin-amd64)"
+          linux_arm="$(dl_sha linux-arm64)"
+          linux_amd="$(dl_sha linux-amd64)"
+          for h in "$darwin_arm" "$darwin_amd" "$linux_arm" "$linux_amd"; do
+            case "$h" in
+              [0-9a-f]*) [ ${#h} -eq 64 ] || { echo "bad sha length: $h" >&2; exit 1; } ;;
+              *) echo "missing checksum" >&2; exit 1 ;;
+            esac
+          done
+
+          mkdir -p tap/Formula
+          cat > tap/Formula/salvager.rb <<RUBY
+          class Salvager < Formula
+            desc "Undo for AI agents — filesystem-level code safety net"
+            homepage "https://github.com/usesalvager/salvager"
+            version "${ver_no_v}"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "${base}/salvager-${VERSION}-darwin-arm64"
+                sha256 "${darwin_arm}"
+              end
+              on_intel do
+                url "${base}/salvager-${VERSION}-darwin-amd64"
+                sha256 "${darwin_amd}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/salvager-${VERSION}-linux-arm64"
+                sha256 "${linux_arm}"
+              end
+              on_intel do
+                url "${base}/salvager-${VERSION}-linux-amd64"
+                sha256 "${linux_amd}"
+              end
+            end
+
+            def install
+              bin.install Dir["salvager-*"].first => "salvager"
+            end
+
+            test do
+              assert_match "salvager v#{version}", shell_output("#{bin}/salvager --version")
+            end
+          end
+          RUBY
+
+      - name: Commit and push
+        if: steps.gate.outputs.enabled == 'true'
+        working-directory: tap
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if git diff --quiet -- Formula/salvager.rb; then
+            echo "Formula already up to date — nothing to push."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/salvager.rb
+          git commit -m "salvager ${VERSION}"
+          git push
