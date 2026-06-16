@@ -95,6 +95,7 @@ func cmdWatch(root string, args []string) {
 		fatal(err)
 	}
 	w.SetAllowPartial(allowPartial)
+	w.ProbeRacySlop() // widen the gate's racy window on coarse-mtime filesystems (best-effort)
 	defer w.Close()
 
 	done := make(chan struct{})
