@@ -1,4 +1,4 @@
-# `salvager` — Local History for agents
+# `salvager` — Undo for AI agents
 
 > Home: **[salvager.sh](https://salvager.sh)**
 
