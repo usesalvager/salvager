@@ -96,6 +96,12 @@ salvager restore config.json 1718312445
 No purge or delete is exposed over MCP — the safety net can't be erased by the
 agent that might break things.
 
+Every tool is contained to the project root: a `file` argument that escapes the
+tree (`../`, an absolute path, or empty) is refused with a structured error
+before any read, write, or delete — the MCP can never reach a file outside the
+watched project. `list_versions` on a file with no history is a success, not an
+error: it returns `tracked: false` with an empty `versions` list.
+
 Register it with an MCP client (e.g. Claude Code):
 
 ```json
