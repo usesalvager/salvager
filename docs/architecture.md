@@ -66,10 +66,39 @@ fully recoverable under the old one (`salvager history old.txt` / `restore`).
 
 ## Retention and garbage collection
 
-`salvager gc` drops revisions older than N days (default 7) and garbage-collects
-any object no longer referenced by any log. Because objects are deduplicated by
-hash, an object is only removed once **no** log line anywhere references it. Run
-it manually or once a day.
+`salvager gc` bounds disk along two independent axes — **age** and **size** —
+sharing one refcount-under-dedup rule: because objects are content-addressed, an
+object is freed only once **no** log line anywhere references it. Run it manually
+or once a day.
+
+**By age (`--max-age`, default 7d).** Drops every revision older than the
+threshold, then sweeps any object left unreferenced. A blob shared by N revisions
+survives until the last of them ages out.
+
+**By size (`--max-bytes`, e.g. `500M` — K/M/G are KiB/MiB/GiB).** Caps the store
+when age alone is not enough: many *recent* revisions of large files can fill disk
+inside the retention window. Capture never excludes content by size (that would
+contradict "capture everything" — see [Capture model](#capture-model-streaming-no-size-cap));
+disk control lives here, in retention.
+- **What it bounds:** the budget is measured over **objects on disk** — the
+  physically freeable unit — not over a revision count. Size is the summed
+  on-disk size (`Stat`) of the referenced objects; an object shared by N
+  revisions counts once and is freed only when its last reference is evicted (the
+  same refcount as age GC).
+- **Eviction policy:** oldest-first, global by timestamp (deterministic). Evicts
+  old → new until the store is back under budget or a protection is hit. Reaching
+  that floor while still over budget is a reported outcome, not an error.
+
+Two invariants protect the store from either axis:
+
+- **Never leave a file without a net.** Each file's newest revision is
+  inevictable — it is the floor of the budget. If even the last objects don't fit,
+  GC stops at that floor rather than stripping any file of its last revision.
+- **Never break a restore's reversibility (asymmetric guard).** A `pre-restore`
+  is the proof that its `restore` can be undone. GC never evicts a `pre-restore`
+  while leaving its `restore` alive. The rule is asymmetric: the pair evicts
+  *together* when both fall in the excess — what never happens is a `restore`
+  surviving without its `pre-restore`.
 
 ## MCP path containment
 
