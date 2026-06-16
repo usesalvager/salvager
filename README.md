@@ -15,6 +15,33 @@ Salvager can: it has been quietly saving a revision of that file every time it
 changed, so you `restore` it in one command. No commits, no checkpoints, no
 configuration — just a running watcher and a recoverable history.
 
+## Install
+
+**Install script** (macOS / Linux) — downloads the right prebuilt binary, verifies
+its SHA-256 checksum, and puts it on your PATH:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/usesalvager/salvager/main/install.sh | sh
+```
+
+Pin a version or pick the install dir with environment variables:
+
+```sh
+SALVAGER_VERSION=v1.1.0 \
+SALVAGER_INSTALL_DIR="$HOME/.local/bin" \
+  curl -fsSL https://raw.githubusercontent.com/usesalvager/salvager/main/install.sh | sh
+```
+
+It installs to `/usr/local/bin` if writable, otherwise `$HOME/.local/bin`. It never
+uses `sudo`, sends no telemetry, and does not edit your shell config. The checksum
+is verified before anything is installed — a mismatch aborts with nothing written.
+
+**Homebrew** (macOS / Linux):
+
+```sh
+brew install usesalvager/tap/salvager
+```
+
 ## Build
 
 ```sh
