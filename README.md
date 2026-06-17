@@ -63,7 +63,32 @@ advertises to clients — one source of truth (`version.Version`).
 
 ## Quickstart
 
+Right after installing, run `init` once in your project — it's the one-command
+onboarding:
+
+```sh
+salvager init
 ```
+
+It connects your agent to Salvager with no JSON to copy by hand:
+
+- registers the Salvager **MCP server** for this project in Claude Code (scope
+  *local* — private to you, never committed), via the `claude` CLI; and
+- adds a short block to your **user** `~/.claude/CLAUDE.md` telling the agent the
+  Salvager tools exist and when to use them.
+
+`init` is an idempotent reconciler: run it twice and nothing changes; run it after
+something drifts and it repairs only what drifted. It only ever rewrites its own
+delimited block in `CLAUDE.md` and never touches `~/.claude.json` by hand. Flags:
+`--no-claude-md` (register the MCP server only) and `--undo` (remove both pieces).
+It does not start the watcher — that's the next step below.
+
+> Requires the `claude` CLI on your PATH for the MCP step. If it's missing, `init`
+> still updates `CLAUDE.md` and prints the exact command to run yourself. Only
+> Claude Code is supported for now.
+
+```
+salvager init [--no-claude-md] [--undo]  connect this project's agent
 salvager watch [--allow-partial]  start the watcher (runs until killed)
 salvager history <file>           list recorded versions of a file
 salvager show <file> <ts>         print the content of one version
@@ -110,7 +135,8 @@ agent that might break things. Every tool is also contained to the project root:
 a `file` argument that escapes the tree is refused before any read or write (see
 [architecture](docs/architecture.md#mcp-path-containment)).
 
-Register it with an MCP client (e.g. Claude Code):
+For Claude Code, `salvager init` registers this for you (scope local). To wire it
+into another MCP client by hand, point it at the binary:
 
 ```json
 {
@@ -163,7 +189,8 @@ reproducible external harness in `bench/`, not patched into the watcher.
 
 ## Scope (v1)
 
-In: watcher, per-file store, list/get/restore/record, pre-restore safeguard,
+In: one-command onboarding (`init`: MCP registration + user CLAUDE.md, idempotent,
+reversible), watcher, per-file store, list/get/restore/record, pre-restore safeguard,
 polling sweep for over-cap subtrees (automatic full coverage) + `--allow-partial`
 degradation policy, `.gitignore` + default excludes, CLI, MCP (3 tools),
 age- and size-based retention (always keeps each file's latest revision, never
