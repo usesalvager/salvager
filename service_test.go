@@ -112,6 +112,41 @@ func TestInstallPreflightFailureDoesNotInstall(t *testing.T) {
 	}
 }
 
+// Test 1b: the REAL preflight guards install. Test 1 stubs preflight to isolate
+// the install plumbing; this drives a genuine construction failure through the
+// production defaultPreflight — root is a regular file, so store.Init's MkdirAll
+// fails with ENOTDIR — proving the guard catches a real failure, not just that
+// install honours an injected error.
+func TestInstallRealPreflightGuards(t *testing.T) {
+	// The production preflight itself must fail on a non-directory root.
+	notDir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(notDir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultPreflight(notDir); err == nil {
+		t.Fatalf("defaultPreflight must fail when the root cannot host a store")
+	}
+
+	// And install wired to the real preflight refuses, writing no unit.
+	env, rec, _, errBuf := newServiceTestEnv(t, "linux")
+	env.root = notDir
+	env.preflight = defaultPreflight // production preflight, NOT a stub
+	rec.responder = systemdInstalledResponder(env, false)
+
+	if code := runServiceInstall(env, nil); code == 0 {
+		t.Fatalf("install must refuse when the real preflight fails")
+	}
+	if _, err := os.Stat(systemdUnitPath(env)); !os.IsNotExist(err) {
+		t.Errorf("no unit may be written when the real preflight fails")
+	}
+	if !strings.Contains(errBuf.String(), "preflight failed") {
+		t.Errorf("must surface the actionable failure; got:\n%s", errBuf.String())
+	}
+	if rec.sawArg("enable") {
+		t.Errorf("must not enable a unit after a real preflight failure")
+	}
+}
+
 // Test 2: install when already running is a no-op (no enable, no file rewrite).
 func TestInstallIdempotentAlreadyRunning(t *testing.T) {
 	env, rec, out, _ := newServiceTestEnv(t, "linux")
