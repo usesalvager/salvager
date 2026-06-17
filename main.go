@@ -1,7 +1,9 @@
 // Command salvager is a filesystem-level local-history safety net for agents.
 //
 //	salvager init                     connect this project's agent to salvager
-//	salvager watch                    start the watcher (runs until killed)
+//	salvager watch [--root <path>]    start the watcher (runs until killed)
+//	salvager service install|uninstall|status
+//	                                  run the watcher as a persistent service
 //	salvager history <file>           list recorded versions of a file
 //	salvager show <file> <ts>         print the content of one version
 //	salvager restore <file> <ts>      restore a file to a version (reversible)
@@ -36,7 +38,10 @@ const usage = `salvager — local history for agents
 Usage:
   salvager init [--no-claude-md] [--undo]
                                     connect this project's agent (MCP + CLAUDE.md)
-  salvager watch [--allow-partial]  start the watcher (runs until killed)
+  salvager watch [--root <path>] [--allow-partial]
+                                    start the watcher (runs until killed)
+  salvager service install | uninstall | status [--json]
+                                    run the watcher as a persistent service
   salvager history <file>           list recorded versions of a file
   salvager show <file> <timestamp>  print the content of one version
   salvager restore <file> <ts>      restore a file to a version (reversible)
@@ -62,6 +67,8 @@ func main() {
 		cmdInit(root, args)
 	case "watch":
 		cmdWatch(root, args)
+	case "service":
+		cmdService(root, args)
 	case "history":
 		cmdHistory(root, args)
 	case "show":
@@ -82,15 +89,37 @@ func main() {
 	}
 }
 
-func cmdWatch(root string, args []string) {
+// parseWatchFlags applies `watch`'s flags to the cwd-derived root. --root
+// overrides the root with an explicit absolute path (resolved via filepath.Abs);
+// absent, the root is returned unchanged — zero regression for existing usage.
+// Kept pure so the flag contract is unit-testable without starting a watcher.
+func parseWatchFlags(root string, args []string) (string, bool, error) {
 	allowPartial := false
-	for _, a := range args {
-		switch a {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
 		case "--allow-partial":
 			allowPartial = true
+		case "--root":
+			if i+1 >= len(args) {
+				return root, false, fmt.Errorf("--root requires a path")
+			}
+			abs, err := filepath.Abs(args[i+1])
+			if err != nil {
+				return root, false, err
+			}
+			root = abs
+			i++
 		default:
-			fatalf("usage: salvager watch [--allow-partial]")
+			return root, false, fmt.Errorf("unknown flag %q", args[i])
 		}
+	}
+	return root, allowPartial, nil
+}
+
+func cmdWatch(root string, args []string) {
+	root, allowPartial, err := parseWatchFlags(root, args)
+	if err != nil {
+		fatalf("usage: salvager watch [--root <path>] [--allow-partial]")
 	}
 
 	s := store.New(root)
