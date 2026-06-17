@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // recordedRun is a fake serviceEnv.run: it records every command and answers
@@ -59,6 +60,7 @@ func newServiceTestEnv(t *testing.T, goos string) (*serviceEnv, *recordedRun, *b
 		preflight: func(string) error { return nil },
 		lookPath:  func(string) (string, error) { return "/usr/bin/systemctl", nil },
 		getenv:    func(k string) string { return "/run/user/501" },
+		sleep:     func(time.Duration) {},
 	}
 	return env, rec, &out, &errBuf
 }
@@ -221,6 +223,61 @@ func TestInstallLingerOffHonesty(t *testing.T) {
 	}
 }
 
+// A binary path or watched root containing a space must render as quoted tokens
+// in ExecStart, so systemd passes them as single arguments instead of splitting
+// on the space (which would launch the watcher with a truncated --root).
+func TestSystemdExecStartQuotesSpaces(t *testing.T) {
+	env, _, _, _ := newServiceTestEnv(t, "linux")
+	env.exe = "/opt/my apps/salvager"
+	env.root = "/Users/jane/My Projects/app"
+
+	unit := buildUnit(env)
+	var execLine string
+	for _, line := range strings.Split(unit, "\n") {
+		if strings.HasPrefix(line, "ExecStart=") {
+			execLine = strings.TrimPrefix(line, "ExecStart=")
+		}
+	}
+	if execLine == "" {
+		t.Fatalf("no ExecStart line in unit:\n%s", unit)
+	}
+	// Each token, including the spaced ones, must appear double-quoted.
+	for _, want := range []string{`"/opt/my apps/salvager"`, `"watch"`, `"--root"`, `"/Users/jane/My Projects/app"`} {
+		if !strings.Contains(execLine, want) {
+			t.Errorf("ExecStart missing quoted token %s; got: %s", want, execLine)
+		}
+	}
+	// And it must NOT contain the unquoted, space-split form.
+	if strings.Contains(execLine, "/opt/my apps/salvager watch") {
+		t.Errorf("ExecStart left the command unquoted (will split on spaces): %s", execLine)
+	}
+}
+
+// Sibling of the systemd quoting fix in a different serialization format: the
+// launchd plist puts each argument in its own <string> element, which is
+// space-safe by construction. This guards that property so a refactor to a
+// single ProgramArguments line (which WOULD split on spaces) is caught.
+func TestLaunchdPlistKeepsSpacedArgsSeparate(t *testing.T) {
+	env, _, _, _ := newServiceTestEnv(t, "darwin")
+	env.exe = "/opt/my apps/salvager"
+	env.root = "/Users/jane/My Projects/app"
+
+	plist := buildPlist(env)
+	for _, want := range []string{
+		"<string>/opt/my apps/salvager</string>",
+		"<string>--root</string>",
+		"<string>/Users/jane/My Projects/app</string>",
+	} {
+		if !strings.Contains(plist, want) {
+			t.Errorf("plist missing intact element %q;\n%s", want, plist)
+		}
+	}
+	// The spaced exe and the watch verb must never share a <string> element.
+	if strings.Contains(plist, "<string>/opt/my apps/salvager watch") {
+		t.Errorf("plist collapsed exe+arg into one element (would split on spaces)")
+	}
+}
+
 // Test 5: --json shape — both a not-installed case and an installed/running case.
 func TestStatusJSONShape(t *testing.T) {
 	wantKeys := []string{"platform", "installed", "state", "running", "persistent", "root", "unit", "logs"}
@@ -348,6 +405,27 @@ func launchdResponder(env *serviceEnv) func(string, []string) (string, int) {
 	}
 }
 
+// launchdSlowStartResponder models a launchd job that reports loaded-but-stopped
+// for its first stoppedPolls `print` queries, then running. A negative
+// stoppedPolls never flips — the job never comes up. The plist must exist (as it
+// does once install writes it) for the job to be considered loaded.
+func launchdSlowStartResponder(env *serviceEnv, stoppedPolls int) func(string, []string) (string, int) {
+	prints := 0
+	return func(name string, args []string) (string, int) {
+		if name == "launchctl" && len(args) > 0 && args[0] == "print" {
+			if _, err := os.Stat(launchdPlistPath(env)); err != nil {
+				return "Could not find service", 1
+			}
+			prints++
+			if stoppedPolls < 0 || prints <= stoppedPolls {
+				return launchdLabel(env) + " = {\n\tstate = stopped\n}\n", 0
+			}
+			return launchdLabel(env) + " = {\n\tstate = running\n}\n", 0
+		}
+		return "", 0
+	}
+}
+
 // launchd path: install writes a plist, verifies running, and reports persistent
 // by design; status --json reflects platform=launchd. Runs on any CI box because
 // goos is injected.
@@ -396,5 +474,51 @@ func TestInstallLaunchdPath(t *testing.T) {
 	}
 	if !rec.sawArg("bootout") {
 		t.Errorf("uninstall must bootout the job")
+	}
+}
+
+// A watcher over a large tree can report "stopped" for the first few post-install
+// polls before launchd settles it to "running". Install must wait out that grace
+// window instead of false-reporting "installed but not running".
+func TestInstallLaunchdWaitsForSlowStart(t *testing.T) {
+	env, rec, out, _ := newServiceTestEnv(t, "darwin")
+
+	// Job reports loaded-but-stopped for its first two polls, then running.
+	rec.responder = launchdSlowStartResponder(env, 2)
+
+	sleeps := 0
+	env.sleep = func(time.Duration) { sleeps++ }
+
+	if code := runServiceInstall(env, nil); code != 0 {
+		t.Fatalf("install should wait out a slow start and succeed, got %d", code)
+	}
+	if sleeps == 0 {
+		t.Errorf("expected the running-state poll to retry (sleep) on a slow start")
+	}
+	if !strings.Contains(out.String(), "survives reboot") {
+		t.Errorf("install should report running after the grace window; got:\n%s", out.String())
+	}
+}
+
+// A job that never comes up must still fail honestly after the grace window —
+// the retry loop bounds its attempts and does not hang or paper over a real
+// failure.
+func TestInstallLaunchdGivesUpWhenNeverRunning(t *testing.T) {
+	env, rec, out, _ := newServiceTestEnv(t, "darwin")
+
+	// Job never flips to running, no matter how many times we poll.
+	rec.responder = launchdSlowStartResponder(env, -1)
+
+	sleeps := 0
+	env.sleep = func(time.Duration) { sleeps++ }
+
+	if code := runServiceInstall(env, nil); code == 0 {
+		t.Fatalf("install should fail when the job never runs")
+	}
+	if sleeps != serviceStartRetries {
+		t.Errorf("expected exactly %d retries before giving up, got %d", serviceStartRetries, sleeps)
+	}
+	if !strings.Contains(out.String(), "not running") {
+		t.Errorf("failure must surface 'not running'; got:\n%s", out.String())
 	}
 }

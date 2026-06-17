@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/usesalvager/salvager/ignore"
 	"github.com/usesalvager/salvager/store"
@@ -62,7 +63,9 @@ type serviceStatus struct {
 // piece of external state through serviceEnv.run, so tests inject a fake runner.
 type serviceManager interface {
 	platform() string
-	install(env *serviceEnv) []pieceResult
+	// install returns the report pieces plus the final running-state it polled
+	// for (via awaitRunning), so the caller need not re-query the manager.
+	install(env *serviceEnv) ([]pieceResult, serviceStatus)
 	uninstall(env *serviceEnv) []pieceResult
 	status(env *serviceEnv) serviceStatus
 }
@@ -88,6 +91,9 @@ type serviceEnv struct {
 	preflight func(root string) error
 	lookPath  func(file string) (string, error)
 	getenv    func(key string) string
+	// sleep paces the post-install running-state poll. Injectable so tests
+	// exercise the retry loop without real wall-clock delay.
+	sleep func(d time.Duration)
 }
 
 // newServiceEnv wires the production environment.
@@ -114,7 +120,31 @@ func newServiceEnv(root string) *serviceEnv {
 		preflight: defaultPreflight,
 		lookPath:  exec.LookPath,
 		getenv:    os.Getenv,
+		sleep:     time.Sleep,
 	}
+}
+
+// Post-install, the freshly kickstarted watcher can take a few seconds to
+// settle before the service manager reports it "running": registering fsevents
+// watches over a large tree is not instant, and launchd's minimum-runtime gate
+// means an immediate check can race ahead of the daemon. Rather than
+// false-reporting "installed but not running", we poll with a short grace
+// window (~6s total) and only give up if it genuinely never comes up.
+const (
+	serviceStartRetries = 12
+	serviceStartDelay   = 500 * time.Millisecond
+)
+
+// awaitRunning polls status until it reports Running, or the grace window is
+// exhausted. status is the manager's own status func, so the seam stays
+// injectable for tests.
+func awaitRunning(env *serviceEnv, status func(*serviceEnv) serviceStatus) serviceStatus {
+	st := status(env)
+	for i := 0; i < serviceStartRetries && !st.Running; i++ {
+		env.sleep(serviceStartDelay)
+		st = status(env)
+	}
+	return st
 }
 
 // defaultRun invokes a real command, folding stderr into stdout for parsing,
@@ -179,6 +209,10 @@ func runServiceInstall(env *serviceEnv, args []string) int {
 				fmt.Fprintln(env.stderr, "usage: salvager service install [--root <path>] [--allow-partial]")
 				return 2
 			}
+			if strings.HasPrefix(args[i+1], "-") {
+				fmt.Fprintf(env.stderr, "salvager: --root requires a path, got flag %q\n", args[i+1])
+				return 2
+			}
 			abs, err := filepath.Abs(args[i+1])
 			if err != nil {
 				fmt.Fprintln(env.stderr, "salvager:", err)
@@ -202,7 +236,7 @@ func runServiceInstall(env *serviceEnv, args []string) int {
 	if st := mgr.status(env); st.Running {
 		printServiceReport(env, "service install", []pieceResult{
 			{label: "service", ok: true, state: "already running"},
-		}, st)
+		})
 		return 0
 	}
 
@@ -219,9 +253,8 @@ func runServiceInstall(env *serviceEnv, args []string) int {
 		return 1
 	}
 
-	results := mgr.install(env)
-	st := mgr.status(env)
-	printServiceReport(env, "service install", results, st)
+	results, st := mgr.install(env)
+	printServiceReport(env, "service install", results)
 	if !st.Running {
 		return 1
 	}
@@ -239,7 +272,12 @@ func runServiceUninstall(env *serviceEnv, args []string) int {
 		return 1
 	}
 	results := mgr.uninstall(env)
-	printServiceReport(env, "service uninstall", results, mgr.status(env))
+	printServiceReport(env, "service uninstall", results)
+	// Exit code must match what we printed: a ✗ piece (e.g. the job could not be
+	// removed) is a failure, not a success.
+	if anyFailed(results) {
+		return 1
+	}
 	return 0
 }
 
@@ -312,7 +350,7 @@ func systemdUsable(env *serviceEnv) bool {
 // without any stored state, and it dodges systemd-escape entirely.
 func projectToken(absRoot string) string {
 	sum := sha256.Sum256([]byte(absRoot))
-	h := hex.EncodeToString(sum[:])[:8]
+	h := shortHash(hex.EncodeToString(sum[:]))
 	base := sanitizeBase(filepath.Base(absRoot))
 	if base == "" {
 		return h
@@ -363,9 +401,26 @@ func printManualFallback(env *serviceEnv) {
 
 // --- reporting -------------------------------------------------------------
 
-func printServiceReport(env *serviceEnv, verb string, results []pieceResult, st serviceStatus) {
-	w := env.stdout
-	fmt.Fprintf(w, "salvager %s — %s\n\n", verb, env.root)
+// anyFailed reports whether any piece of a service report is a failure, so the
+// command can set its exit code to match what it printed.
+func anyFailed(results []pieceResult) bool {
+	for _, r := range results {
+		if !r.ok {
+			return true
+		}
+	}
+	return false
+}
+
+func printServiceReport(env *serviceEnv, verb string, results []pieceResult) {
+	printPieceReport(env.stdout, verb, env.root, results)
+}
+
+// printPieceReport renders a reconciliation report: a header line, one line per
+// piece (✓/✗ label state), then any pieces carrying extra detail. Shared by the
+// `service` and `init` surfaces so the two render identically.
+func printPieceReport(w io.Writer, verb, root string, results []pieceResult) {
+	fmt.Fprintf(w, "salvager %s — %s\n\n", verb, root)
 	var details []pieceResult
 	for _, r := range results {
 		mark := "✓"
@@ -404,9 +459,15 @@ func printStatusHuman(env *serviceEnv, st serviceStatus) {
 	fmt.Fprintf(w, "  logs         %s\n", st.Logs)
 	if st.Platform == "systemd" && st.Installed && !st.Persistent {
 		fmt.Fprintf(w, "\n  This service is running but will NOT survive logout/reboot until you enable\n")
-		fmt.Fprintf(w, "  lingering for your user:\n      loginctl enable-linger %q   (re-run with sudo if it is denied)\n", env.user)
+		fmt.Fprintf(w, "  lingering for your user:\n      %s\n", lingerCommand(env.user))
 		fmt.Fprintf(w, "  then confirm with: salvager service status\n")
 	}
+}
+
+// lingerCommand is the single source for the enable-linger remediation, shared
+// by the status output and the systemd install report so the two cannot drift.
+func lingerCommand(user string) string {
+	return fmt.Sprintf("loginctl enable-linger %q   (re-run with sudo if denied)", user)
 }
 
 func printJSON(env *serviceEnv, st serviceStatus) {

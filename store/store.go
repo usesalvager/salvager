@@ -65,6 +65,47 @@ func safeRel(relPath string) error {
 	return nil
 }
 
+// resolveContained validates relPath lexically (safeRel) and then, defending
+// against a symlinked intermediate component, verifies that the deepest
+// EXISTING ancestor of its absolute form resolves back inside the project root.
+// filepath.IsLocal is purely lexical: it accepts "link/secret" even when "link"
+// is a symlink escaping the tree, which would let an MCP/CLI caller read,
+// overwrite, or delete files outside the root through record/Restore. The
+// watcher never tracks files reached via a symlink, so legitimate paths always
+// resolve under the root; this rejects the rest. Both sides are EvalSymlinks'd
+// so a symlinked root prefix (e.g. macOS /var -> /private/var) compares equal.
+// Returns the absolute working-tree path on success.
+func (s *FS) resolveContained(relPath string) (string, error) {
+	if err := safeRel(relPath); err != nil {
+		return "", err
+	}
+	abs := filepath.Join(s.root, relPath)
+	rootReal, err := filepath.EvalSymlinks(s.root)
+	if err != nil {
+		return "", err
+	}
+	// A not-yet-created leaf cannot itself be a symlink, so walk up to the
+	// deepest ancestor that exists and resolve that.
+	anc := filepath.Dir(abs)
+	for {
+		real, err := filepath.EvalSymlinks(anc)
+		if err == nil {
+			if real != rootReal && !strings.HasPrefix(real, rootReal+string(os.PathSeparator)) {
+				return "", fmt.Errorf("%w: %q", ErrUnsafePath, relPath)
+			}
+			return abs, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(anc)
+		if parent == anc {
+			return "", fmt.Errorf("%w: %q", ErrUnsafePath, relPath)
+		}
+		anc = parent
+	}
+}
+
 // Label classifies why a revision was recorded.
 type Label string
 
@@ -143,10 +184,10 @@ func New(root string) *FS {
 // immediately, even in an empty project before the first change. Read-only
 // entry points (history/show) still create nothing.
 func (s *FS) Init() error {
-	if err := os.MkdirAll(s.objectsDir(), 0o755); err != nil {
+	if err := os.MkdirAll(s.objectsDir(), 0o700); err != nil {
 		return err
 	}
-	return os.MkdirAll(s.indexDir(), 0o755)
+	return os.MkdirAll(s.indexDir(), 0o700)
 }
 
 func (s *FS) dir() string        { return filepath.Join(s.root, Dir) }
@@ -182,7 +223,10 @@ func (s *FS) Record(relPath string) error {
 // pre-restore). Empty label means: pick initial/modify/delete automatically.
 // Caller holds s.mu.
 func (s *FS) record(relPath string, force Label) error {
-	abs := filepath.Join(s.root, relPath)
+	abs, err := s.resolveContained(relPath)
+	if err != nil {
+		return err
+	}
 	f, err := os.Open(abs)
 
 	last, hasLast := s.lastRevision(relPath)
@@ -268,7 +312,7 @@ const sigScanLimit = 64 * 1024
 // Rename failure during placement can never hold the source open. The caller may
 // still keep a deferred Close as a belt — os.File.Close is safe to call twice.
 func (s *FS) captureStream(src io.ReadCloser, last Revision, hasLast bool) (string, revSig, error) {
-	if err := os.MkdirAll(s.objectsDir(), 0o755); err != nil {
+	if err := os.MkdirAll(s.objectsDir(), 0o700); err != nil {
 		return "", revSig{}, err
 	}
 	tmp, err := os.CreateTemp(s.objectsDir(), ".tmp-*")
@@ -486,14 +530,16 @@ func formatLine(r Revision) string {
 // is computed by the caller (which already holds the content) and stored inline.
 func (s *FS) appendLog(relPath string, label Label, hash string, sig revSig) error {
 	lp := s.logPath(relPath)
-	if err := os.MkdirAll(filepath.Dir(lp), 0o755); err != nil {
+	// 0o700/0o600: the history store holds recovered file contents (and any
+	// secrets in them); it must be readable only by the owner, not world-readable.
+	if err := os.MkdirAll(filepath.Dir(lp), 0o700); err != nil {
 		return err
 	}
 	ts := nowFunc()
 	if last, ok := s.lastRevision(relPath); ok && ts <= last.Timestamp {
 		ts = last.Timestamp + 1
 	}
-	f, err := os.OpenFile(lp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(lp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -622,26 +668,22 @@ func (s *FS) Get(relPath string, ts int64) ([]byte, error) {
 // is itself reversible. Strict order; if the safeguard fails, the working tree
 // is left untouched. Returns the safeguard's timestamp.
 func (s *FS) Restore(relPath string, ts int64) (int64, error) {
-	// Containment is checked before ANY effect — in particular before the step-1
-	// pre-restore safeguard, which would otherwise read a foreign file's bytes
-	// into objects/ (an information leak) before the destructive branches even
-	// run. For a traversal path the most dangerous branch is the deletion case
-	// below (os.Remove of an arbitrary host path, with no pre-restore possible);
-	// rejecting here means neither the overwrite nor the delete branch is reached.
-	if err := safeRel(relPath); err != nil {
+	// Containment is checked before ANY effect — rejecting both lexical escapes
+	// and symlinked intermediate components — so neither the pre-restore safeguard
+	// (which would read a foreign file's bytes into objects/, an information leak)
+	// nor the destructive overwrite/delete branches below can touch a path outside
+	// the tree.
+	abs, err := s.resolveContained(relPath)
+	if err != nil {
 		return 0, err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 1. Safeguard: record current state, forced (even if hash is unchanged).
-	if err := s.record(relPath, LabelPreRestore); err != nil {
-		return 0, fmt.Errorf("pre-restore safeguard failed, aborting: %w", err)
-	}
-	pre, _ := s.lastRevision(relPath) // the safeguard becomes this restore's predecessor
-
-	// 2. Read the requested revision.
+	// 1. Validate the requested revision exists BEFORE taking any effect. A bogus
+	// (file, timestamp) must be a pure no-op: recording a pre-restore safeguard
+	// first would append a spurious revision for a target that turns out absent.
 	revs, err := s.readLog(relPath)
 	if err != nil {
 		return 0, err
@@ -657,7 +699,11 @@ func (s *FS) Restore(relPath string, ts int64) (int64, error) {
 		return 0, fmt.Errorf("no revision of %s at timestamp %d", relPath, ts)
 	}
 
-	abs := filepath.Join(s.root, relPath)
+	// 2. Safeguard: record current state, forced (even if hash is unchanged).
+	if err := s.record(relPath, LabelPreRestore); err != nil {
+		return 0, fmt.Errorf("pre-restore safeguard failed, aborting: %w", err)
+	}
+	pre, _ := s.lastRevision(relPath) // the safeguard becomes this restore's predecessor
 
 	if target.Label == LabelDelete {
 		// Restoring to a deletion: remove the file from the working tree.
@@ -804,9 +850,15 @@ func (s *FS) GC(maxAge time.Duration) error {
 		if err != nil {
 			return err
 		}
+		// Pin each file's newest revision (P1), plus its pre-restore predecessor
+		// when the newest is a restore (P2), regardless of age — mirroring
+		// buildEvictionUnits. Without this floor, a file whose every revision
+		// predates the cutoff would be stripped of its last net, the exact data
+		// loss the store exists to prevent.
+		pinned := pinnedIndices(revs)
 		var kept []Revision
-		for _, r := range revs {
-			if r.Timestamp >= cutoff {
+		for i, r := range revs {
+			if r.Timestamp >= cutoff || pinned[i] {
 				kept = append(kept, r)
 			}
 		}
@@ -874,6 +926,23 @@ type evMember struct {
 	relPath string
 	ts      int64
 	hash    string
+}
+
+// pinnedIndices marks the revisions retention must never evict from a single
+// file's oldest-first history: P1 pins the newest revision; P2 also pins the
+// pre-restore immediately preceding a pinned newest restore. It is the floor
+// shared by age GC and (in unit form) buildEvictionUnits.
+func pinnedIndices(revs []Revision) map[int]bool {
+	pinned := map[int]bool{}
+	if len(revs) == 0 {
+		return pinned
+	}
+	newest := len(revs) - 1
+	pinned[newest] = true
+	if revs[newest].Label == LabelRestore && newest-1 >= 0 && revs[newest-1].Label == LabelPreRestore {
+		pinned[newest-1] = true
+	}
+	return pinned
 }
 
 // buildEvictionUnits returns the eviction units in global oldest-first order by

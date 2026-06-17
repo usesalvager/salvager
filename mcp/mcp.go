@@ -6,12 +6,21 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/usesalvager/salvager/store"
 	"github.com/usesalvager/salvager/version"
 )
+
+// maxGetBytes bounds the content salvager_get_version returns inline. A single
+// revision is loaded, stringified, and JSON-encoded into one MCP frame; without
+// a cap a multi-hundred-MB object would blow up memory and the agent's context.
+// Larger revisions are inspected via the list signal (lines/delta/signature) or
+// read from disk directly.
+const maxGetBytes = 5 << 20 // 5 MiB
 
 // Backend is the slice of the store the MCP server consumes.
 type Backend interface {
@@ -135,6 +144,15 @@ func NewServer(b Backend) *mcp.Server {
 		content, err := b.Get(in.File, in.Timestamp)
 		if err != nil {
 			return nil, getOutput{}, err
+		}
+		if len(content) > maxGetBytes {
+			return nil, getOutput{}, fmt.Errorf("revision %d of %s is %d bytes, over the %d-byte inline limit; use salvager_list_versions for its signal or read the object from disk", in.Timestamp, in.File, len(content), maxGetBytes)
+		}
+		// Binary content cannot survive a round-trip through a JSON string field
+		// (invalid UTF-8 is silently replaced); refuse rather than hand back
+		// corrupted bytes the agent would mistake for the real revision.
+		if !utf8.Valid(content) {
+			return nil, getOutput{}, fmt.Errorf("revision %d of %s is binary (non-UTF-8); cannot return as text", in.Timestamp, in.File)
 		}
 		return nil, getOutput{Content: string(content)}, nil
 	})

@@ -33,19 +33,34 @@ func systemdJournalHint(env *serviceEnv) string {
 	return "journalctl --user -u " + systemdUnitName(env)
 }
 
+// systemdExecStart renders the ExecStart command line with every argument
+// double-quoted per systemd's quoting rules, so a binary path or watched root
+// containing a space (or other separator) is passed as ONE argument instead of
+// being split. systemd unquotes "…" with C-style escapes, so we escape \ and ".
+// (Unlike the launchd plist, which lists each arg as a separate element, the
+// unit file is a single line and needs explicit quoting.)
+func systemdExecStart(env *serviceEnv) string {
+	argv := append([]string{env.exe}, watchArgs(env)...)
+	esc := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+	quoted := make([]string, len(argv))
+	for i, a := range argv {
+		quoted[i] = `"` + esc.Replace(a) + `"`
+	}
+	return strings.Join(quoted, " ")
+}
+
 // buildUnit renders the user service. ExecStart carries the absolute binary and
 // the absolute --root, so the watched tree is visible in `systemctl status`.
 // Restart=on-failure keeps it up across crashes (bounded by systemd's burst
 // limit — see the package note).
 func buildUnit(env *serviceEnv) string {
-	exec := env.exe + " " + strings.Join(watchArgs(env), " ")
 	return `[Unit]
 Description=Salvager watcher (` + env.root + `)
 After=default.target
 
 [Service]
 Type=simple
-ExecStart=` + exec + `
+ExecStart=` + systemdExecStart(env) + `
 WorkingDirectory=` + env.root + `
 Restart=on-failure
 RestartSec=5
@@ -55,15 +70,15 @@ WantedBy=default.target
 `
 }
 
-func (m systemdManager) install(env *serviceEnv) []pieceResult {
+func (m systemdManager) install(env *serviceEnv) ([]pieceResult, serviceStatus) {
 	unit := systemdUnitName(env)
 	path := systemdUnitPath(env)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return []pieceResult{{label: "service", ok: false, state: "could not create unit dir", detail: err.Error()}}
+		return []pieceResult{{label: "service", ok: false, state: "could not create unit dir", detail: err.Error()}}, serviceStatus{}
 	}
-	if err := os.WriteFile(path, []byte(buildUnit(env)), 0o644); err != nil {
-		return []pieceResult{{label: "service", ok: false, state: "could not write unit", detail: err.Error()}}
+	if err := writeFileAtomic(path, []byte(buildUnit(env)), 0o644); err != nil {
+		return []pieceResult{{label: "service", ok: false, state: "could not write unit", detail: err.Error()}}, serviceStatus{}
 	}
 
 	env.run("systemctl", "--user", "daemon-reload")
@@ -73,10 +88,10 @@ func (m systemdManager) install(env *serviceEnv) []pieceResult {
 			ok:     false,
 			state:  "could not enable",
 			detail: "inspect: " + systemdJournalHint(env),
-		}}
+		}}, serviceStatus{}
 	}
 
-	st := m.status(env)
+	st := awaitRunning(env, m.status)
 	results := []pieceResult{}
 	if !st.Running {
 		return []pieceResult{{
@@ -84,7 +99,7 @@ func (m systemdManager) install(env *serviceEnv) []pieceResult {
 			ok:     false,
 			state:  "enabled but not running",
 			detail: "inspect: " + systemdJournalHint(env),
-		}}
+		}}, st
 	}
 	results = append(results, pieceResult{label: "service", ok: true, state: "running (" + unit + ")"})
 
@@ -97,12 +112,12 @@ func (m systemdManager) install(env *serviceEnv) []pieceResult {
 			ok:    false,
 			state: "running, but NOT yet persistent",
 			detail: "this will not survive logout/reboot until lingering is enabled:\n" +
-				"        loginctl enable-linger \"" + env.user + "\"   (re-run with sudo if denied)\n" +
+				"        " + lingerCommand(env.user) + "\n" +
 				"      then confirm with: salvager service status",
 		})
 	}
 	results = append(results, pieceResult{label: "logs", ok: true, state: systemdJournalHint(env)})
-	return results
+	return results, st
 }
 
 func (m systemdManager) uninstall(env *serviceEnv) []pieceResult {
