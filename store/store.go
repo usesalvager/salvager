@@ -202,6 +202,64 @@ func (s *FS) objectPath(hash string) string {
 	return filepath.Join(s.objectsDir(), hash)
 }
 
+// lockWait bounds how long a writer (or a Get's shared reader) blocks waiting
+// for the cross-process store lock before giving up with a clear error rather
+// than hanging. 30s clears every BOUNDED holder with margin — a large-file
+// Record/Restore runs at roughly 2s/GB — and sits ~4 orders of magnitude under
+// Claude Code's default MCP_TOOL_TIMEOUT (~28h; salvager registers no per-server
+// timeout), so a timeout surfaces as salvager's own clean error, never a
+// truncated MCP tool call. It deliberately does NOT bound GC, whose hold scales
+// with store size (see gcLocked): a rare overlap of an interactive restore with
+// a large concurrent `salvager gc` fails loud and retryable, never silently
+// corrupt and never an unlocked write.
+const lockWait = 30 * time.Second
+
+// lockPath is the single coarse lock guarding all cross-process access to one
+// .salvager store. One lock file, never deleted (removing a flock'd file races a
+// peer that still holds it). Writers take it exclusive; Get takes it shared.
+func (s *FS) lockPath() string { return filepath.Join(s.dir(), "lock") }
+
+// withWriteLock runs fn under both the in-process mutex (peers in THIS process)
+// and an exclusive flock (peers in OTHER processes — the watcher service, CLI
+// invocations, the MCP server, each holding its own store.New over the same
+// directory). s.mu is taken first, so at most one goroutine per process ever
+// contends the flock. fn never runs unless the flock was acquired: on timeout
+// the helper returns the error and fn is skipped — the store is never mutated
+// while unlocked.
+func (s *FS) withWriteLock(fn func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, err := acquireFlock(s.lockPath(), true, lockWait)
+	if err != nil {
+		return err
+	}
+	defer h.release()
+	return fn()
+}
+
+// withReadLock runs fn under a SHARED flock: concurrent readers proceed together
+// but exclude any exclusive writer. It does NOT take s.mu — readers must not
+// serialize behind one another. It locks only when a store already exists: on an
+// untracked project (no .salvager/) there is nothing to read and nothing to
+// race, and locking would materialize the store, violating the "read-only
+// commands create nothing" invariant. When the store exists it ensures the lock
+// file (so even a store first written by a pre-lock binary is serialized against
+// a concurrent sweep). Only Get needs this lock (see getLocked).
+func (s *FS) withReadLock(fn func() error) error {
+	if _, err := os.Stat(s.dir()); err != nil {
+		if os.IsNotExist(err) {
+			return fn() // no store: nothing to lock against, create nothing
+		}
+		return err
+	}
+	h, err := acquireFlock(s.lockPath(), false, lockWait)
+	if err != nil {
+		return err
+	}
+	defer h.release()
+	return fn()
+}
+
 func sha256hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
@@ -214,9 +272,9 @@ func (s *FS) Record(relPath string) error {
 	if err := safeRel(relPath); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.record(relPath, "")
+	return s.withWriteLock(func() error {
+		return s.record(relPath, "")
+	})
 }
 
 // record does the work; label forces a specific label (used by Restore for
@@ -648,6 +706,21 @@ func (s *FS) Get(relPath string, ts int64) ([]byte, error) {
 	if err := safeRel(relPath); err != nil {
 		return nil, err
 	}
+	var out []byte
+	err := s.withReadLock(func() error {
+		b, e := s.getLocked(relPath, ts)
+		out = b
+		return e
+	})
+	return out, err
+}
+
+// getLocked is the body of Get; the caller holds a SHARED read lock. That lock
+// is what makes the log→object lookup atomic against a concurrent GC sweep:
+// without it, an object that was valid when the log named it can be swept in the
+// window before ReadFile opens it (a dangling read). List needs no such lock —
+// it never performs this second lookup into objects/.
+func (s *FS) getLocked(relPath string, ts int64) ([]byte, error) {
 	revs, err := s.readLog(relPath)
 	if err != nil {
 		return nil, err
@@ -678,9 +751,18 @@ func (s *FS) Restore(relPath string, ts int64) (int64, error) {
 		return 0, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	var preTs int64
+	err = s.withWriteLock(func() error {
+		p, e := s.restoreLocked(relPath, abs, ts)
+		preTs = p
+		return e
+	})
+	return preTs, err
+}
 
+// restoreLocked is the body of Restore; the caller holds the write lock. abs is
+// the validated, containment-checked working-tree path.
+func (s *FS) restoreLocked(relPath, abs string, ts int64) (int64, error) {
 	// 1. Validate the requested revision exists BEFORE taking any effect. A bogus
 	// (file, timestamp) must be a pure no-op: recording a pre-restore safeguard
 	// first would append a spurious revision for a target that turns out absent.
@@ -833,9 +915,18 @@ func (s *FS) TrackedUnder(relDir string, recursive bool) ([]string, error) {
 // GC removes revisions older than maxAge and any objects no longer referenced
 // by any log (reference-counted garbage collection).
 func (s *FS) GC(maxAge time.Duration) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.withWriteLock(func() error { return s.gcLocked(maxAge) })
+}
 
+// gcLocked is the body of GC; the caller holds the write lock. GC intentionally
+// holds the lock for its ENTIRE run (read logs → rewrite → sweep), so its hold
+// scales with store size — tens of seconds on a very large store (~28s over a
+// measured 20k-file store). Bounding GC's hold by chunking it requires
+// re-validating the referenced set per batch against concurrent writers — a
+// distinct re-reference hazard that deserves its own proven change, not this
+// one. lockWait is sized with this unbounded hold in mind: a rare
+// restore-vs-GC overlap fails loud and retryable, never silently corrupt.
+func (s *FS) gcLocked(maxAge time.Duration) error {
 	cutoff := nowFunc() - maxAge.Milliseconds()
 
 	logs, err := s.allLogs()
@@ -1007,9 +1098,18 @@ func (s *FS) buildEvictionUnits(perFile map[string][]Revision) [][]evMember {
 // until both are gone. Eviction order is global oldest-first by (timestamp,
 // relPath). Composes after GC(maxAge): prune by age first, then cap what remains.
 func (s *FS) GCBySize(maxBytes int64) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	var final int64
+	err := s.withWriteLock(func() error {
+		f, e := s.gcBySizeLocked(maxBytes)
+		final = f
+		return e
+	})
+	return final, err
+}
 
+// gcBySizeLocked is the body of GCBySize; the caller holds the write lock. Like
+// gcLocked it holds the lock for its whole run (see that note on GC's hold).
+func (s *FS) gcBySizeLocked(maxBytes int64) (int64, error) {
 	logs, err := s.allLogs()
 	if err != nil {
 		return 0, err
