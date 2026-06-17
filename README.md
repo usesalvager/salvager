@@ -7,6 +7,10 @@ revisions automatically; when an agent (or a human) breaks something, you
 recover it with one command. Designed to be consumed by the agent itself over
 MCP, so it can self-repair.
 
+The whole binary is free forever under Apache-2.0 — every feature, no crippled
+tier, no paid unlock. What's sold (support, deployment, compliance) is work a
+local binary physically can't do, not features withheld from it.
+
 ## Why
 
 An AI agent rewrites a file, deletes work you hadn't committed, or clobbers an
@@ -14,6 +18,66 @@ uncommitted change — and `git` can't bring it back, because it was never stage
 Salvager can: it has been quietly saving a revision of that file every time it
 changed, so you `restore` it in one command. No commits, no checkpoints, no
 configuration — just a running watcher and a recoverable history.
+
+## Recover a state git never held
+
+A refactor lands in passes: a clean rename by hand first, then a later blanket
+sed over-applies and breaks the build. You want the last-good pass back — but the
+clean rename was never committed or stashed, so git holds only the old code and
+the broken tree. Salvager saved every pass:
+
+```text
+# rename Session -> Run across watcher.go and cli.go
+● Renamed the type and its call sites in both files by hand. Build is green.
+$ go build ./...
+⎿ (ok)
+● Now a blanket sed to catch any stragglers across the package.
+$ grep -rl Session . | xargs sed -i 's/Session/Run/g'
+⎿ (rewrote watcher.go, cli.go)
+$ go build ./...
+⎿ # github.com/usesalvager/watcher
+⎿ watcher.go:9:14: undefined: cfg.RunTimeout
+✗ The sed also hit cfg.SessionTimeout, a config key that had to stay. The build is broken.
+● I want the hand-rename back, without losing it to a full reset. It was never committed.
+$ git stash list
+⎿ (empty)
+✗ Nothing was committed or stashed between the rename and the sed. git has only the old code and the broken tree.
+
+● Salvager recorded every save. The clean pre-sed revision of each file is in its history.
+$ salvager history watcher.go
+⎿ TIMESTAMP            HASH      LABEL       LINES  ΔLINES  START
+⎿ 2026-06-17 13:02:33  1c3a997b  modify      17     +1      package watcher
+⎿ 2026-06-17 13:02:31  85fb497d  modify      16     +0      package watcher
+⎿ 2026-06-17 13:02:30  af46411e  first-seen  16     +16     package watcher
+⎿ restore with: salvager restore watcher.go <timestamp-ms>
+⎿ (timestamps below are human-readable; raw ms:)
+⎿   1781694153232  modify
+⎿   1781694151932  modify
+⎿   1781694150430  first-seen
+● The 13:02:31 revision is the clean rename — before the sed. Restoring it.
+$ salvager restore watcher.go 1781694151932
+⎿ restored watcher.go to revision 1781694151932
+⎿ previous state saved as pre-restore revision 1781694161069 (undo with: salvager restore watcher.go 1781694161069)
+✓ Restore is non-destructive — the broken tree is kept as its own revision, so the recovery itself is reversible.
+
+● Same for cli.go, the other file the sed touched.
+$ salvager history cli.go
+⎿ TIMESTAMP            HASH      LABEL       LINES  ΔLINES  START
+⎿ 2026-06-17 13:02:34  57a69357  modify      9      +1      package watcher
+⎿ 2026-06-17 13:02:32  c8fe5c77  modify      8      +0      package watcher
+⎿ 2026-06-17 13:02:30  7a70eda4  first-seen  8      +8      package watcher
+⎿ restore with: salvager restore cli.go <timestamp-ms>
+⎿ (timestamps below are human-readable; raw ms:)
+⎿   1781694154432  modify
+⎿   1781694152033  modify
+⎿   1781694150430  first-seen
+$ salvager restore cli.go 1781694152033
+⎿ restored cli.go to revision 1781694152033
+⎿ previous state saved as pre-restore revision 1781694161076 (undo with: salvager restore cli.go 1781694161076)
+$ go build ./...
+⎿ (ok)
+✓ Both files back to the clean rename — the sed undone, the refactor kept. A state git never held.
+```
 
 ## Install
 
@@ -27,7 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/usesalvager/salvager/main/install.s
 Pin a version or pick the install dir with environment variables:
 
 ```sh
-SALVAGER_VERSION=v1.1.0 \
+SALVAGER_VERSION=v1.2.0 \
 SALVAGER_INSTALL_DIR="$HOME/.local/bin" \
   curl -fsSL https://raw.githubusercontent.com/usesalvager/salvager/main/install.sh | sh
 ```
@@ -52,10 +116,12 @@ Single static binary, no runtime. macOS and Linux supported; Windows is
 build-from-source best-effort (no prebuilt binary).
 
 A plain build reports its version as `dev` (`salvager --version` → `salvager dev`).
-For a release, inject the version via ldflags:
+To stamp a real version, derive it from the current git tag via ldflags — the
+same form the release workflow injects, so a local build's `--version` matches a
+published binary and never goes stale:
 
 ```sh
-CGO_ENABLED=0 go build -ldflags "-X 'github.com/usesalvager/salvager/version.Version=1.0.0'" -o salvager .
+CGO_ENABLED=0 go build -ldflags "-X 'github.com/usesalvager/salvager/version.Version=$(git describe --tags --always)'" -o salvager .
 ```
 
 The same value backs both `salvager --version` and the version the MCP server
