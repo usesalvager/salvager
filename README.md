@@ -89,7 +89,8 @@ It does not start the watcher — that's the next step below.
 
 ```
 salvager init [--no-claude-md] [--undo]  connect this project's agent
-salvager watch [--allow-partial]  start the watcher (runs until killed)
+salvager watch [--root <path>] [--allow-partial]  start the watcher (until killed)
+salvager service install | uninstall | status [--json]  run the watcher as a service
 salvager history <file>           list recorded versions of a file
 salvager show <file> <ts>         print the content of one version
 salvager restore <file> <ts>      restore a file to a version (reversible)
@@ -99,7 +100,29 @@ salvager gc [--max-age 7d] [--max-bytes 500M]  purge old revisions and cap store
 
 Run `salvager watch` in the root of any project — zero configuration. It records
 an initial revision of every tracked file on startup, then captures every
-change (debounced ~300 ms) thereafter.
+change (debounced ~300 ms) thereafter. `--root <path>` watches a tree other than
+the current directory; without it, the working directory is used.
+
+### Run it persistently
+
+`salvager watch` runs until killed. To install it once and forget it — surviving
+terminal close and reboot — register it as a per-project service:
+
+```sh
+salvager service install     # start now + on every login/reboot
+salvager service status       # installed? running? persistent? (add --json for scripts)
+salvager service uninstall    # stop and remove cleanly
+```
+
+It uses a **launchd** LaunchAgent on macOS and a **systemd user service** on
+Linux — both per-user, no root for the unit itself. Install runs a preflight and
+verifies the service is actually running before reporting success, so a tree the
+watcher can't start on fails loud at install time instead of crash-looping later.
+
+> **Linux:** a systemd user service does not survive logout/reboot until
+> *lingering* is enabled. If it's off, `service install`/`status` tells you so
+> (never falsely claiming persistence) and prints the one command to fix it:
+> `loginctl enable-linger "$USER"` (re-run with `sudo` if denied).
 
 When something goes wrong, recover it. `restore` never destroys: before
 overwriting the file it saves the current on-disk state as a `pre-restore`

@@ -87,7 +87,7 @@ func cmdInit(root string, args []string) {
 		}
 	}
 
-	exe, err := os.Executable()
+	exe, err := selfExe()
 	if err != nil {
 		fatal(err)
 	}
