@@ -1,5 +1,6 @@
 // Command salvager is a filesystem-level local-history safety net for agents.
 //
+//	salvager init                     connect this project's agent to salvager
 //	salvager watch                    start the watcher (runs until killed)
 //	salvager history <file>           list recorded versions of a file
 //	salvager show <file> <ts>         print the content of one version
@@ -33,6 +34,8 @@ import (
 const usage = `salvager — local history for agents
 
 Usage:
+  salvager init [--no-claude-md] [--undo]
+                                    connect this project's agent (MCP + CLAUDE.md)
   salvager watch [--allow-partial]  start the watcher (runs until killed)
   salvager history <file>           list recorded versions of a file
   salvager show <file> <timestamp>  print the content of one version
@@ -55,6 +58,8 @@ func main() {
 
 	args := os.Args[2:]
 	switch os.Args[1] {
+	case "init":
+		cmdInit(root, args)
 	case "watch":
 		cmdWatch(root, args)
 	case "history":
