@@ -281,6 +281,81 @@ func TestGC(t *testing.T) {
 	}
 }
 
+// Regression: when EVERY revision of a file predates the age cutoff, GC must
+// still keep the newest one (P1) rather than erasing the file's whole history.
+// Before the fix, age GC pruned blind and left the file with zero recoverable
+// revisions — the exact data loss the store exists to prevent.
+func TestGCKeepsNewestWhenAllOlderThanCutoff(t *testing.T) {
+	clock := fakeClock(t)
+	root := t.TempDir()
+	s := New(root)
+
+	write(t, root, "a.txt", "v1")
+	s.Record("a.txt")
+	atomic.AddInt64(clock, 1000)
+	write(t, root, "a.txt", "v2")
+	s.Record("a.txt")
+
+	// Jump far past both revisions so a 24h cutoff leaves NONE by age alone.
+	atomic.AddInt64(clock, int64(48*time.Hour/time.Millisecond))
+	if err := s.GC(24 * time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	revs, _ := s.List("a.txt")
+	if len(revs) != 1 {
+		t.Fatalf("GC erased a file's whole history: want 1 pinned survivor, got %d", len(revs))
+	}
+	got, err := s.Get("a.txt", revs[0].Timestamp)
+	if err != nil || string(got) != "v2" {
+		t.Fatalf("newest revision unrecoverable after GC: content=%q err=%v", got, err)
+	}
+	objs, _ := os.ReadDir(filepath.Join(root, Dir, "objects"))
+	if len(objs) != 1 {
+		t.Errorf("want 1 object retained for the pinned revision, got %d", len(objs))
+	}
+}
+
+// Regression: a restore pins both itself (P1) and its pre-restore (P2) even when
+// both predate the age cutoff, so a recorded restore stays reversible.
+func TestGCKeepsPreRestorePairWhenOlderThanCutoff(t *testing.T) {
+	clock := fakeClock(t)
+	root := t.TempDir()
+	s := New(root)
+
+	write(t, root, "a.txt", "first")
+	s.Record("a.txt")
+	atomic.AddInt64(clock, 1000)
+	write(t, root, "a.txt", "second")
+	s.Record("a.txt")
+	atomic.AddInt64(clock, 1000)
+	// Restore the first revision: writes a pre-restore (of "second") then a
+	// restore back-to-back as the two newest revisions.
+	first, _ := s.List("a.txt")
+	if _, err := s.Restore("a.txt", first[0].Timestamp); err != nil {
+		t.Fatal(err)
+	}
+
+	atomic.AddInt64(clock, int64(48*time.Hour/time.Millisecond))
+	if err := s.GC(24 * time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	revs, _ := s.List("a.txt")
+	var nPre, nRestore int
+	for _, r := range revs {
+		switch r.Label {
+		case LabelPreRestore:
+			nPre++
+		case LabelRestore:
+			nRestore++
+		}
+	}
+	if nPre != 1 || nRestore != 1 {
+		t.Fatalf("pre-restore/restore pair not preserved: pre=%d restore=%d (revs=%d)", nPre, nRestore, len(revs))
+	}
+}
+
 // Test 1: exceeding the budget evicts the oldest revisions until the store fits;
 // the newest is pinned (P1). Object size == content length (content-addressed).
 func TestGCBySizeEvictsOldest(t *testing.T) {

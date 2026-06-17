@@ -48,6 +48,27 @@ func TestGitignoreRespected(t *testing.T) {
 	}
 }
 
+// A directory-only pattern ("secret/") must match the directory ITSELF via
+// MatchDir, so the walker prunes the whole subtree instead of descending into a
+// gitignored directory. Match (file semantics) must NOT match a bare file named
+// "secret", or it would wrongly stop tracking that file.
+func TestGitignoreDirectoryPattern(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, ".gitignore"), []byte("secret/\n"), 0o644)
+	m := New(root)
+
+	if !m.MatchDir(filepath.Join(root, "secret")) {
+		t.Error("MatchDir(secret) should be true so the dir subtree is pruned")
+	}
+	if m.Match(filepath.Join(root, "secret")) {
+		t.Error("Match(secret) as a file must be false (a file named secret is not a dir)")
+	}
+	// Contents are excluded either way.
+	if !m.Match(filepath.Join(root, "secret/key.txt")) {
+		t.Error("secret/key.txt should be ignored")
+	}
+}
+
 func TestRootItself(t *testing.T) {
 	root := t.TempDir()
 	m := New(root)

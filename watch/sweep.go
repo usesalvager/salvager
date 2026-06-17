@@ -75,8 +75,8 @@ type sweeper struct {
 	interval time.Duration
 
 	mu    sync.Mutex
-	roots map[string]struct{}    // overflow subtree roots, relative to root
-	seen  map[string]fileState   // last-observed stat per file, relative to root
+	roots map[string]struct{}  // overflow subtree roots, relative to root
+	seen  map[string]fileState // last-observed stat per file, relative to root
 
 	stats sweepStats
 }

@@ -128,6 +128,44 @@ func TestStore_Guard_AcceptsLegitSubdirPaths(t *testing.T) {
 	}
 }
 
+// A symlinked intermediate component is a NON-lexical escape: "link/key.txt" is
+// a clean relative path (filepath.IsLocal accepts it) yet resolves outside the
+// root when "link" is a symlink to a foreign dir. resolveContained must reject
+// it so an MCP/CLI caller cannot read, overwrite, or delete host files through
+// it. PRIMARY assertion: a secret file outside the root is byte-unchanged.
+func TestStore_Guard_RejectsSymlinkedComponentEscape(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "project")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(parent, "secret")
+	if err := os.MkdirAll(secret, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const body = "host secret — out of bounds"
+	keyPath := filepath.Join(secret, "key.txt")
+	if err := os.WriteFile(keyPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// project/link -> ../secret: an escaping symlinked component.
+	if err := os.Symlink(secret, filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlinks unsupported on this platform: %v", err)
+	}
+
+	s := New(root)
+	if err := s.Record("link/key.txt"); !errors.Is(err, ErrUnsafePath) {
+		t.Errorf("Record(link/key.txt) err = %v, want ErrUnsafePath", err)
+	}
+	if _, err := s.Restore("link/key.txt", 1); !errors.Is(err, ErrUnsafePath) {
+		t.Errorf("Restore(link/key.txt) err = %v, want ErrUnsafePath", err)
+	}
+	// PRIMARY: the foreign file was never read into the store nor modified.
+	if got, _ := os.ReadFile(keyPath); string(got) != body {
+		t.Errorf("host file changed through symlinked component: got %q", got)
+	}
+}
+
 // Defense in depth: Record is the store's only writer, fed by the watcher with
 // already-local paths, but it guards too so no caller can write outside the root.
 func TestStore_Record_RejectsTraversal(t *testing.T) {

@@ -103,6 +103,12 @@ func parseWatchFlags(root string, args []string) (string, bool, error) {
 			if i+1 >= len(args) {
 				return root, false, fmt.Errorf("--root requires a path")
 			}
+			// Reject a following flag token, so `watch --root --allow-partial`
+			// fails loudly instead of silently treating "--allow-partial" as the
+			// path (and then watching a directory literally named that).
+			if strings.HasPrefix(args[i+1], "-") {
+				return root, false, fmt.Errorf("--root requires a path, got flag %q", args[i+1])
+			}
 			abs, err := filepath.Abs(args[i+1])
 			if err != nil {
 				return root, false, err
@@ -119,7 +125,7 @@ func parseWatchFlags(root string, args []string) (string, bool, error) {
 func cmdWatch(root string, args []string) {
 	root, allowPartial, err := parseWatchFlags(root, args)
 	if err != nil {
-		fatalf("usage: salvager watch [--root <path>] [--allow-partial]")
+		fatalf("%v\nusage: salvager watch [--root <path>] [--allow-partial]", err)
 	}
 
 	s := store.New(root)

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -102,7 +101,7 @@ func cmdInit(root string, args []string) {
 		home:       home,
 		exePath:    exe,
 		claudePath: claudePath,
-		runClaude:  defaultRunClaude,
+		runClaude:  func(args ...string) (string, int) { return defaultRun("claude", args...) },
 		stdout:     os.Stdout,
 		stderr:     os.Stderr,
 	}
@@ -112,26 +111,6 @@ func cmdInit(root string, args []string) {
 		return
 	}
 	runInit(env, noClaudeMD)
-}
-
-// defaultRunClaude invokes the real `claude` CLI and returns its stdout and exit
-// code. A non-zero exit is a normal signal (e.g. `mcp get` for an absent server),
-// not a fatal error, so it never returns an error — only the code.
-func defaultRunClaude(args ...string) (string, int) {
-	cmd := exec.Command("claude", args...)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out // claude prints some status to stderr; fold it in for parsing
-	err := cmd.Run()
-	code := 0
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else {
-			code = -1
-		}
-	}
-	return out.String(), code
 }
 
 // runInit reconciles both pieces and prints the report.
@@ -348,17 +327,16 @@ func mergeBlock(content string, exists bool) (string, string) {
 		return desired + "\n", "created"
 	}
 
-	if i := strings.Index(content, mdStartMarker); i >= 0 {
-		j := strings.Index(content, mdEndMarker)
-		if j >= i {
-			j += len(mdEndMarker)
-			replaced := content[:i] + desired + content[j:]
-			if replaced == content {
-				return content, "already current"
-			}
-			return replaced, "updated"
+	// Reconcile to EXACTLY one current block: strip every existing block (a
+	// duplicate can arise from a raced run or a hand edit) and reinsert the
+	// desired block where the first one was.
+	stripped, firstIdx, found := removeAllBlocks(content)
+	if found {
+		replaced := stripped[:firstIdx] + desired + stripped[firstIdx:]
+		if replaced == content {
+			return content, "already current"
 		}
-		// Start marker without a matching end — treat as no block and append.
+		return replaced, "updated"
 	}
 
 	// No (usable) block present → append, preserving everything above.
@@ -367,6 +345,33 @@ func mergeBlock(content string, exists bool) (string, string) {
 		base += "\n"
 	}
 	return base + "\n" + desired + "\n", "updated"
+}
+
+// removeAllBlocks strips every salvager start..end region from content and
+// reports the offset where the first one began. The end marker is always sought
+// AFTER its start, so a stray end-marker token appearing before the real block
+// cannot shadow it (which would orphan the appended block on undo). A start
+// marker with no following end is left intact (treated as not-a-block).
+func removeAllBlocks(content string) (stripped string, firstIdx int, found bool) {
+	firstIdx = -1
+	out := content
+	for {
+		i := strings.Index(out, mdStartMarker)
+		if i < 0 {
+			break
+		}
+		rel := strings.Index(out[i:], mdEndMarker)
+		if rel < 0 {
+			break // start without a matching end → not a usable block
+		}
+		j := i + rel + len(mdEndMarker)
+		if firstIdx < 0 {
+			firstIdx = i
+		}
+		out = out[:i] + out[j:]
+		found = true
+	}
+	return out, firstIdx, found
 }
 
 // undoClaudeMD removes the salvager block, restoring the file to roughly its
@@ -390,17 +395,14 @@ func undoClaudeMD(env *initEnv) pieceResult {
 	}
 	content := string(data)
 
-	i := strings.Index(content, mdStartMarker)
-	j := strings.Index(content, mdEndMarker)
-	if i < 0 || j < i {
+	stripped, _, found := removeAllBlocks(content)
+	if !found {
 		r.ok = true
 		r.state = "no block present (nothing to remove)"
 		return r
 	}
-	j += len(mdEndMarker)
 
-	result := content[:i] + content[j:]
-	result = collapseBlankRun(result)
+	result := collapseBlankRun(stripped)
 	result = strings.TrimRight(result, "\n")
 	if result != "" {
 		result += "\n"
@@ -426,29 +428,16 @@ func collapseBlankRun(s string) string {
 	return s
 }
 
-// atomicWrite writes via a temp file in the same dir + rename, so the original is
-// replaced atomically and never left half-written. The original bytes survive on
-// disk until the rename succeeds — that is the temporary backup; no permanent
-// .bak file is left behind.
+// atomicWrite replaces the CLAUDE.md at path atomically (temp + rename), so it is
+// never left half-written. It preserves the existing file's permissions when
+// replacing it; only a brand-new file gets the 0o644 default. Forcing 0o644
+// unconditionally would silently widen a CLAUDE.md the user had restricted.
 func atomicWrite(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".salvager-claudemd-*")
-	if err != nil {
-		return err
+	mode := os.FileMode(0o644)
+	if fi, err := os.Stat(path); err == nil {
+		mode = fi.Mode().Perm()
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return writeFileAtomic(path, data, mode)
 }
 
 // --- report ----------------------------------------------------------------
@@ -459,26 +448,7 @@ func report(env *initEnv, root string, results []pieceResult, undo bool) {
 	if undo {
 		verb = "init --undo"
 	}
-	fmt.Fprintf(w, "salvager %s — %s\n\n", verb, root)
-
-	var details []pieceResult
-	for _, r := range results {
-		mark := "✓" // ✓
-		if !r.ok {
-			mark = "✗" // ✗
-		}
-		fmt.Fprintf(w, "  %-12s %s %s\n", r.label, mark, r.state)
-		if r.detail != "" {
-			details = append(details, r)
-		}
-	}
-
-	if len(details) > 0 {
-		fmt.Fprintln(w)
-		for _, r := range details {
-			fmt.Fprintf(w, "  %s: %s\n", r.label, r.detail)
-		}
-	}
+	printPieceReport(w, verb, root, results)
 
 	if !undo {
 		fmt.Fprintln(w)

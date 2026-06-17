@@ -73,20 +73,20 @@ func buildPlist(env *serviceEnv) string {
 `
 }
 
-func (m launchdManager) install(env *serviceEnv) []pieceResult {
+func (m launchdManager) install(env *serviceEnv) ([]pieceResult, serviceStatus) {
 	label := launchdLabel(env)
 	plist := launchdPlistPath(env)
 	outPath, _ := launchdLogPaths(env)
 
 	// Ensure the log and LaunchAgents directories exist before we write/load.
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return []pieceResult{{label: "service", ok: false, state: "could not create log dir", detail: err.Error()}}
+		return []pieceResult{{label: "service", ok: false, state: "could not create log dir", detail: err.Error()}}, serviceStatus{}
 	}
 	if err := os.MkdirAll(filepath.Dir(plist), 0o755); err != nil {
-		return []pieceResult{{label: "service", ok: false, state: "could not create LaunchAgents dir", detail: err.Error()}}
+		return []pieceResult{{label: "service", ok: false, state: "could not create LaunchAgents dir", detail: err.Error()}}, serviceStatus{}
 	}
-	if err := os.WriteFile(plist, []byte(buildPlist(env)), 0o644); err != nil {
-		return []pieceResult{{label: "service", ok: false, state: "could not write plist", detail: err.Error()}}
+	if err := writeFileAtomic(plist, []byte(buildPlist(env)), 0o644); err != nil {
+		return []pieceResult{{label: "service", ok: false, state: "could not write plist", detail: err.Error()}}, serviceStatus{}
 	}
 
 	// bootstrap loads the agent. Its exit code is unreliable (errors if already
@@ -97,20 +97,20 @@ func (m launchdManager) install(env *serviceEnv) []pieceResult {
 	env.run("launchctl", "bootstrap", launchdDomain(env), plist)
 	env.run("launchctl", "kickstart", "-k", launchdTarget(env))
 
-	st := m.status(env)
+	st := awaitRunning(env, m.status)
 	if !st.Running {
 		return []pieceResult{{
 			label:  "service",
 			ok:     false,
 			state:  "installed but not running",
 			detail: "inspect the log: " + outPath + "  (or: launchctl print " + launchdTarget(env) + ")",
-		}}
+		}}, st
 	}
 	return []pieceResult{
 		{label: "service", ok: true, state: "running (" + label + ")"},
 		{label: "persistent", ok: true, state: "✓ survives reboot (restarts at login)"},
 		{label: "logs", ok: true, state: outPath},
-	}
+	}, st
 }
 
 func (m launchdManager) uninstall(env *serviceEnv) []pieceResult {
@@ -130,6 +130,17 @@ func (m launchdManager) uninstall(env *serviceEnv) []pieceResult {
 		return []pieceResult{{label: "service", ok: false, state: "could not remove plist", detail: err.Error()}}
 	}
 	outPath, _ := launchdLogPaths(env)
+	// bootout's exit code is unreliable, so verify rather than assume: if the job
+	// is still loaded after removing the plist, the unload failed and reporting
+	// "removed" would be a false success.
+	if st := m.status(env); st.Installed {
+		return []pieceResult{{
+			label:  "service",
+			ok:     false,
+			state:  "plist removed but job still loaded",
+			detail: "the launchd job did not unload; inspect: launchctl print " + launchdTarget(env),
+		}}
+	}
 	return []pieceResult{
 		{label: "service", ok: true, state: "removed"},
 		{label: "logs", ok: true, state: "left in place: " + outPath},

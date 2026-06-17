@@ -313,28 +313,34 @@ func (w *Watcher) pollingAvailable() bool {
 // sweep re-enumerates it (recording the initial revisions on its first pass),
 // so nothing in that subtree is lost, it is merely covered by polling instead.
 func (w *Watcher) initialScan() error {
-	return filepath.WalkDir(w.root, func(path string, d fs.DirEntry, err error) error {
+	return w.walkAndRegister(w.root)
+}
+
+// addTree registers a newly created directory and all its (tracked) contents,
+// recording any files found. Used when a directory appears at runtime. If the
+// backend refuses a directory for the descriptor limit, that subtree is handed
+// to the polling sweep instead of being silently lost.
+func (w *Watcher) addTree(dir string) {
+	_ = w.walkAndRegister(dir)
+}
+
+// walkAndRegister walks dir, recording every tracked file and registering every
+// tracked directory with the backend. An ignored directory is pruned (SkipDir);
+// a directory the backend refuses — for the descriptor limit or ANY other reason
+// — is handed to the polling sweep so coverage stays whole rather than silently
+// dropped (the descriptor limit is the expected, silent case; anything else is
+// worth one log line). Symlinks are never followed. Shared by the initial scan
+// and runtime directory additions so the two cannot drift.
+func (w *Watcher) walkAndRegister(dir string) error {
+	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip unreadable entries, keep going
 		}
-		if w.ign.Match(path) {
-			if d.IsDir() {
+		if d.IsDir() {
+			if w.ign.MatchDir(path) {
 				return filepath.SkipDir // don't descend into ignored dirs
 			}
-			return nil
-		}
-		if d.Type()&fs.ModeSymlink != 0 {
-			return nil // never follow symlinks (may point outside the project)
-		}
-		if d.IsDir() {
 			if err := w.backend.AddDir(path); err != nil {
-				// ANY directory we could not place under a live watch is handed
-				// to the polling sweep — not only the classified descriptor
-				// limit — so coverage stays whole regardless of why the backend
-				// refused. The descriptor limit is the expected, silent case;
-				// anything else (an unclassified overflow errno, a transient
-				// backend error, EACCES) is unexpected and worth one log line,
-				// but it is covered all the same rather than silently dropped.
 				if !isDescriptorLimit(err) {
 					log.Printf("salvager: watch add %s: %v (covering by polling)", path, err)
 				}
@@ -343,40 +349,8 @@ func (w *Watcher) initialScan() error {
 			}
 			return nil
 		}
-		w.recordRealtime(w.rel(path), path)
-		return nil
-	})
-}
-
-// addTree registers a newly created directory and all its (tracked) contents,
-// recording any files found. Used when a directory appears at runtime. If the
-// backend refuses a directory for the descriptor limit, that subtree is handed
-// to the polling sweep instead of being silently lost.
-func (w *Watcher) addTree(dir string) {
-	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if w.ign.Match(path) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if d.Type()&fs.ModeSymlink != 0 {
-			return nil // never follow symlinks (may point outside the project)
-		}
-		if d.IsDir() {
-			if err := w.backend.AddDir(path); err != nil {
-				// Any AddDir failure -> polling, so a directory appearing at
-				// runtime that the backend refuses is covered, not dropped.
-				if !isDescriptorLimit(err) {
-					log.Printf("salvager: watch add %s: %v (covering by polling)", path, err)
-				}
-				w.sweeper.addRoot(path)
-				return filepath.SkipDir
-			}
-			return nil
+		if w.ign.Match(path) || d.Type()&fs.ModeSymlink != 0 {
+			return nil // ignored file, or a symlink we never follow
 		}
 		w.recordRealtime(w.rel(path), path)
 		return nil
@@ -400,10 +374,17 @@ func (w *Watcher) Run(done <-chan struct{}) error {
 		return ErrPartialCoverage
 	}
 
+	// stop is closed on EVERY Run return — not only when the caller closes done,
+	// but also when Run exits because the backend's event/error channel closed —
+	// so the sweep goroutine is always torn down instead of leaking past the
+	// watcher's life.
+	stop := make(chan struct{})
+	defer close(stop)
+
 	// Start the sweep unconditionally when polling is available: it is cheap
 	// with no roots and immediately covers any overflow that appears at runtime.
 	if w.pollingAvailable() {
-		go w.sweeper.run(done)
+		go w.sweeper.run(stop)
 	}
 
 	pending := map[string]time.Time{}
@@ -422,19 +403,23 @@ func (w *Watcher) Run(done <-chan struct{}) error {
 			if w.ign.Match(ev.Path) {
 				continue
 			}
-			// Never follow symlinks: a link can point outside the project or
-			// form a loop. Lstat inspects the link itself, not its target. A
-			// missing path (Lstat error) falls through so deletions still record.
-			if fi, err := os.Lstat(ev.Path); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			// Inspect the path once. Lstat sees the link itself, not its target,
+			// so a symlink (which may point outside the project or loop) is never
+			// followed. A missing path (Lstat error) falls through so deletions
+			// still record.
+			fi, statErr := os.Lstat(ev.Path)
+			if statErr == nil && fi.Mode()&fs.ModeSymlink != 0 {
 				continue
 			}
-			// A newly created directory must be registered (and scanned), since
-			// per-directory backends won't report events inside it otherwise.
-			if ev.Op&Create != 0 {
-				if fi, err := os.Stat(ev.Path); err == nil && fi.IsDir() {
+			if statErr == nil && fi.IsDir() {
+				// A newly created directory must be registered and scanned (a
+				// per-directory backend won't report events inside it otherwise).
+				// Any other directory event carries no file content to record —
+				// queuing it would only fail later with EISDIR.
+				if ev.Op&Create != 0 {
 					w.addTree(ev.Path)
-					continue
 				}
+				continue
 			}
 			pending[ev.Path] = nowFunc()
 

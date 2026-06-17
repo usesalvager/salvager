@@ -342,8 +342,10 @@ func TestAcc_A7_5_RestoreToDeleteRevisionRemovesFile(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// A9.3 — gc keeps an object still referenced by a recent rev, while removing an
-// object referenced only by purged (old) revs.
+// A9.3 — gc collects an object referenced only by evicted (old, non-newest)
+// revs, while keeping objects still referenced — including each file's pinned
+// newest revision, which age GC never evicts (README: "always keeps each file's
+// latest revision").
 // -----------------------------------------------------------------------------
 
 func TestAcc_A9_3_GCKeepsStillReferencedObject(t *testing.T) {
@@ -351,20 +353,27 @@ func TestAcc_A9_3_GCKeepsStillReferencedObject(t *testing.T) {
 	root := t.TempDir()
 	s := New(root)
 
-	// Old content "shared" recorded into a.txt while the clock is "old".
+	// Old content "shared" recorded into a.txt while the clock is "old". a.txt's
+	// only rev is its newest, so it is pinned and survives regardless of age.
 	write(t, root, "a.txt", "shared")
 	if err := s.Record("a.txt"); err != nil {
 		t.Fatal(err)
 	}
 	sharedHash := sha256hex([]byte("shared"))
 
-	// Old content "lonely" recorded into b.txt, also old; will be purged and
-	// nothing else references it.
+	// b.txt gets TWO old revs: "lonely" then "lonelyV2". After GC the older
+	// "lonely" rev is evicted (non-newest, past cutoff) and its object — which
+	// nothing else references — is collected; "lonelyV2" is b.txt's pinned newest.
 	write(t, root, "b.txt", "lonely")
 	if err := s.Record("b.txt"); err != nil {
 		t.Fatal(err)
 	}
 	lonelyHash := sha256hex([]byte("lonely"))
+	atomic.AddInt64(clock, 1000)
+	write(t, root, "b.txt", "lonelyV2")
+	if err := s.Record("b.txt"); err != nil {
+		t.Fatal(err)
+	}
 
 	if !accObjectExists(t, root, sharedHash) || !accObjectExists(t, root, lonelyHash) {
 		t.Fatalf("precondition: both objects should exist")
@@ -378,26 +387,37 @@ func TestAcc_A9_3_GCKeepsStillReferencedObject(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// GC with a 24h window: a.txt's old 'shared' rev and b.txt's old 'lonely'
-	// rev are both older than the cutoff and get purged. c.txt's recent
-	// 'shared' rev survives.
+	// GC with a 24h window: every revision recorded before the jump is past the
+	// cutoff, but each file's newest is pinned. Only b.txt's older "lonely" rev
+	// is actually evicted.
 	if err := s.GC(24 * time.Hour); err != nil {
 		t.Fatal(err)
 	}
 
-	// shared object survives (still referenced by c.txt's recent rev).
+	// shared object survives (referenced by a.txt's pinned rev and c.txt's recent rev).
 	if !accObjectExists(t, root, sharedHash) {
-		t.Errorf("gc removed 'shared' object that is still referenced by a recent rev")
+		t.Errorf("gc removed 'shared' object that is still referenced")
 	}
-	// lonely object is gone (referenced only by purged revs).
+	// lonely object is gone (its only referencing rev was evicted).
 	if accObjectExists(t, root, lonelyHash) {
 		t.Errorf("gc kept 'lonely' object that no surviving rev references")
 	}
 
-	// a.txt's log should now be empty/gone (its only rev was purged).
+	// a.txt keeps its pinned newest (the latest-revision floor), content intact.
 	aRevs, _ := s.List("a.txt")
-	if len(aRevs) != 0 {
-		t.Errorf("a.txt should have no surviving revisions, got %d", len(aRevs))
+	if len(aRevs) != 1 {
+		t.Fatalf("a.txt should keep its pinned newest rev, got %d", len(aRevs))
+	}
+	if got, _ := s.Get("a.txt", aRevs[0].Timestamp); !bytes.Equal(got, []byte("shared")) {
+		t.Errorf("a.txt surviving content = %q, want shared", got)
+	}
+	// b.txt keeps only its pinned newest "lonelyV2".
+	bRevs, _ := s.List("b.txt")
+	if len(bRevs) != 1 {
+		t.Fatalf("b.txt should keep 1 (pinned newest) rev, got %d", len(bRevs))
+	}
+	if got, _ := s.Get("b.txt", bRevs[0].Timestamp); !bytes.Equal(got, []byte("lonelyV2")) {
+		t.Errorf("b.txt surviving content = %q, want lonelyV2", got)
 	}
 	// c.txt's recent rev survives and its content is still retrievable.
 	cRevs, _ := s.List("c.txt")

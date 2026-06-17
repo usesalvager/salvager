@@ -35,12 +35,14 @@ var Defaults = []string{
 // is gone before the debounce fires; these patterns cover the long-lived ones.
 var EditorTemp = []string{
 	"*.swp", "*.swo", "*.swn", // vim swap
-	"*~",               // emacs/gedit/joe/nano backup
-	".#*",              // emacs lock
-	"#*#",              // emacs autosave
-	"4913",             // vim write-permission probe file
-	".goutputstream-*", // GNOME / gedit
-	".~lock.*#",        // LibreOffice
+	"*~",                // emacs/gedit/joe/nano backup
+	".#*",               // emacs lock
+	"#*#",               // emacs autosave
+	"4913",              // vim write-permission probe file
+	".goutputstream-*",  // GNOME / gedit
+	".~lock.*#",         // LibreOffice
+	".salvager-probe-*", // salvager's own mtime-granularity probe temp
+	".salvager-tmp-*",   // salvager's atomic-write temp
 }
 
 // Matcher answers whether a path should be ignored.
@@ -66,10 +68,24 @@ func New(root string) *Matcher {
 	return m
 }
 
-// Match reports whether path (absolute or relative to root) should be ignored.
-// A path is ignored if any of its components is a default exclude, or if the
-// .gitignore matches it.
+// Match reports whether path (absolute or relative to root) should be ignored,
+// treating it as a file. A path is ignored if any of its components is a default
+// exclude, or if the .gitignore matches it.
 func (m *Matcher) Match(path string) bool {
+	return m.match(path, false)
+}
+
+// MatchDir is Match for a directory: it additionally honors directory-only
+// .gitignore patterns (e.g. "logs/"), which this library matches only by the
+// trailing-slash form, not the bare name. Call it at WalkDir/SkipDir decisions
+// so a gitignored directory subtree is pruned whole rather than descended into.
+// (A regular file must still go through Match, or a file literally named "logs"
+// would be wrongly ignored by a "logs/" pattern.)
+func (m *Matcher) MatchDir(path string) bool {
+	return m.match(path, true)
+}
+
+func (m *Matcher) match(path string, isDir bool) bool {
 	rel := path
 	if filepath.IsAbs(path) {
 		if r, err := filepath.Rel(m.root, path); err == nil {
@@ -101,8 +117,14 @@ func (m *Matcher) Match(path string) bool {
 		}
 	}
 
-	if m.gi != nil && m.gi.MatchesPath(rel) {
-		return true
+	if m.gi != nil {
+		if m.gi.MatchesPath(rel) {
+			return true
+		}
+		// Directory-only patterns match the dir itself only via its slash form.
+		if isDir && m.gi.MatchesPath(rel+"/") {
+			return true
+		}
 	}
 	return false
 }

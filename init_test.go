@@ -351,3 +351,72 @@ func TestNoClaudeMD_FlagSkipsFile(t *testing.T) {
 		t.Error("--no-claude-md should still register MCP")
 	}
 }
+
+// #24 — atomicWrite must NOT widen the permissions of an existing file. This is
+// a failure-mode the happy-path suite can't catch: a normal init run stays green
+// whether perms are preserved or clobbered, because nothing else asserts them.
+func TestAtomicWrite_PreservesExistingPerms(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "CLAUDE.md")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil { // defeat umask, pin the mode
+		t.Fatal(err)
+	}
+	if err := atomicWrite(path, []byte("new content")); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("atomicWrite widened perms: got %o, want 0600", fi.Mode().Perm())
+	}
+	if got, _ := os.ReadFile(path); string(got) != "new content" {
+		t.Errorf("content not written: %q", got)
+	}
+}
+
+// A brand-new file gets the 0o644 default (subject to umask, so assert it is not
+// MORE permissive than 0o644).
+func TestAtomicWrite_NewFileDefaultPerms(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "CLAUDE.md")
+	if err := atomicWrite(path, []byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&^0o644 != 0 {
+		t.Errorf("new file more permissive than 0644: got %o", fi.Mode().Perm())
+	}
+}
+
+// #35/#36 — writeFileAtomic writes the exact bytes at the requested mode and
+// leaves no temp file behind. (Crash-atomicity itself needs fault injection to
+// prove; this guards the observable contract: content, mode, and a clean dir.)
+func TestWriteFileAtomic_ContentModeAndNoTempLeftover(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "unit.service")
+	if err := writeFileAtomic(path, []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "[Unit]\n" {
+		t.Errorf("content = %q", got)
+	}
+	fi, _ := os.Stat(path)
+	if fi.Mode().Perm()&^0o644 != 0 {
+		t.Errorf("mode too permissive: %o", fi.Mode().Perm())
+	}
+	// No .salvager-tmp-* left in the directory.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".salvager-tmp-") {
+			t.Errorf("atomic write left a temp file behind: %s", e.Name())
+		}
+	}
+}
