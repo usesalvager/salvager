@@ -91,7 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/usesalvager/salvager/main/install.s
 Pin a version or pick the install dir with environment variables:
 
 ```sh
-SALVAGER_VERSION=v1.2.0 \
+SALVAGER_VERSION=v1.2.1 \
 SALVAGER_INSTALL_DIR="$HOME/.local/bin" \
   curl -fsSL https://raw.githubusercontent.com/usesalvager/salvager/main/install.sh | sh
 ```
