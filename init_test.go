@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,10 +13,11 @@ import (
 // subcommand verb ("get", "add", "remove"). It models the real CLI's contract:
 // `mcp get` exits non-zero when the server is absent, zero when present.
 type fakeClaude struct {
-	registered bool   // is "salvager" currently registered?
-	command    string // what Command: `get` reports
-	calls      []string
-	failAdd    bool
+	registered   bool   // is "salvager" currently registered?
+	command      string // what Command: `get` reports
+	calls        []string
+	failAdd      bool
+	notConnected bool // registered but NOT connected → `get` omits "Connected"
 }
 
 func (f *fakeClaude) run(args ...string) (string, int) {
@@ -29,7 +31,11 @@ func (f *fakeClaude) run(args ...string) (string, int) {
 		if !f.registered {
 			return "", 1
 		}
-		out := "salvager:\n  Status: ✔ Connected\n  Type: stdio\n  Command: " +
+		status := "✔ Connected"
+		if f.notConnected {
+			status = "✘ Failed to connect"
+		}
+		out := "salvager:\n  Status: " + status + "\n  Type: stdio\n  Command: " +
 			f.command + "\n  Args: mcp\n"
 		return out, 0
 	case "add":
@@ -67,6 +73,18 @@ func newTestEnv(t *testing.T, fc *fakeClaude, claudeOnPath bool) *initEnv {
 		stdout:     io.Discard,
 		stderr:     io.Discard,
 	}
+}
+
+// newCapturingEnv is newTestEnv with stdout routed to a buffer, so a test can
+// assert on init's user-facing report (newTestEnv discards it). The report is
+// the only confirmation the user gets of what init actually did, so it is worth
+// guarding.
+func newCapturingEnv(t *testing.T, fc *fakeClaude, claudeOnPath bool) (*initEnv, *bytes.Buffer) {
+	t.Helper()
+	env := newTestEnv(t, fc, claudeOnPath)
+	var buf bytes.Buffer
+	env.stdout = &buf
+	return env, &buf
 }
 
 func readMD(t *testing.T, env *initEnv) (string, bool) {
@@ -349,6 +367,114 @@ func TestNoClaudeMD_FlagSkipsFile(t *testing.T) {
 	}
 	if !fc.registered {
 		t.Error("--no-claude-md should still register MCP")
+	}
+}
+
+// --- report output --------------------------------------------------------
+//
+// init's report is its only confirmation to the user of what happened: which MCP
+// server got registered, whether CLAUDE.md was written, and what to do next. The
+// rest of the suite routes stdout to io.Discard, so nothing guards these promises
+// — if the report silently drifts or a line is dropped, no test notices. These
+// capture stdout and assert the REAL strings report()/printPieceReport() print.
+
+func TestInit_Report_DefaultRun(t *testing.T) {
+	fc := &fakeClaude{}
+	env, buf := newCapturingEnv(t, fc, true)
+
+	runInit(env, false)
+	out := buf.String()
+
+	// Promise 1: the MCP server was registered for this project (✓, connected —
+	// the fake claude reports "Connected", which report() renders as "connected").
+	if !strings.Contains(out, "MCP server") || !strings.Contains(out, "✓ connected") {
+		t.Errorf("report omits the MCP-registered confirmation:\n%s", out)
+	}
+	// Promise 2: the CLAUDE.md block was written (fresh HOME → "created").
+	if !strings.Contains(out, "CLAUDE.md") || !strings.Contains(out, "✓ created") {
+		t.Errorf("report omits the CLAUDE.md confirmation:\n%s", out)
+	}
+	// Promise 3: the next-step footer points the user at the watcher.
+	if !strings.Contains(out, "Next: start the watcher") {
+		t.Errorf("report omits the start-watcher footer:\n%s", out)
+	}
+}
+
+func TestInit_Report_NoMDFlag(t *testing.T) {
+	fc := &fakeClaude{}
+	env, buf := newCapturingEnv(t, fc, true)
+
+	runInit(env, true) // --no-claude-md
+	out := buf.String()
+
+	// MCP is still registered and confirmed.
+	if !strings.Contains(out, "MCP server") || !strings.Contains(out, "✓ connected") {
+		t.Errorf("--no-claude-md must still confirm MCP registration:\n%s", out)
+	}
+	// No CLAUDE.md piece is reconciled, so no CLAUDE.md line appears at all.
+	if strings.Contains(out, "CLAUDE.md") {
+		t.Errorf("--no-claude-md must not emit a CLAUDE.md confirmation:\n%s", out)
+	}
+	// The footer still guides the user to the watcher.
+	if !strings.Contains(out, "Next: start the watcher") {
+		t.Errorf("--no-claude-md report omits the start-watcher footer:\n%s", out)
+	}
+}
+
+func TestInit_Report_Undo(t *testing.T) {
+	fc := &fakeClaude{registered: true, command: "/usr/local/bin/salvager"}
+	env, buf := newCapturingEnv(t, fc, true)
+
+	// Seed a CLAUDE.md block so undo has both pieces to remove.
+	if r := reconcileClaudeMD(env); r.state != "created" {
+		t.Fatalf("setup: expected created, got %q", r.state)
+	}
+
+	runUndo(env, false)
+	out := buf.String()
+
+	// Undo identifies itself as such in the header.
+	if !strings.Contains(out, "init --undo") {
+		t.Errorf("undo report omits the --undo verb:\n%s", out)
+	}
+	// Both pieces report their removal ("✓ removed" is the MCP line; the
+	// CLAUDE.md line is the distinct "✓ block removed").
+	if !strings.Contains(out, "MCP server") || !strings.Contains(out, "✓ removed") {
+		t.Errorf("undo report omits the MCP removal:\n%s", out)
+	}
+	if !strings.Contains(out, "CLAUDE.md") || !strings.Contains(out, "✓ block removed") {
+		t.Errorf("undo report omits the CLAUDE.md removal:\n%s", out)
+	}
+	// Undo must NOT tell the user to start the watcher.
+	if strings.Contains(out, "Next: start the watcher") {
+		t.Errorf("undo report should not print the start-watcher footer:\n%s", out)
+	}
+}
+
+// registered-but-not-connected is plausibly the MOST common first-run state:
+// init adds the MCP server, but it isn't "Connected" yet (the watcher hasn't
+// started / claude hasn't dialed it). The report must say "registered" there,
+// not "connected" — that wording is exactly what a first-run user sees. The
+// other three report tests only ever hit the connected path.
+func TestInit_Report_RegisteredNotConnected(t *testing.T) {
+	fc := &fakeClaude{notConnected: true}
+	env, buf := newCapturingEnv(t, fc, true)
+
+	runInit(env, false)
+	out := buf.String()
+
+	// Promise: the MCP server is registered (verifyMCP → "registered" when the
+	// `get` output lacks "Connected").
+	if !strings.Contains(out, "MCP server") || !strings.Contains(out, "✓ registered") {
+		t.Errorf("report omits the registered-not-connected MCP confirmation:\n%s", out)
+	}
+	// Isolation: this state must NOT render with the connected-path wording.
+	if strings.Contains(out, "✓ connected") {
+		t.Errorf("registered-not-connected must not render as connected:\n%s", out)
+	}
+	// Footer is not conditional on connection state, so it still prints.
+	if !strings.Contains(out, "Next: start the watcher") {
+		t.Errorf("report omits the start-watcher footer:\n%s", out)
 	}
 }
 
