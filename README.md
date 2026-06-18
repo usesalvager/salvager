@@ -129,8 +129,22 @@ advertises to clients — one source of truth (`version.Version`).
 
 ## Quickstart
 
-Right after installing, run `init` once in your project — it's the one-command
-onboarding:
+Onboarding is two commands, run in this order: turn on the watcher, then connect
+your agent.
+
+**Step 1 — start the watcher as a service.** This is the safety net, so turn it
+on first.
+
+```sh
+salvager service install
+```
+
+Starts the per-project watcher now and on every login/reboot — install it and
+forget it. See [Run it persistently](#run-it-persistently) below for the
+launchd/systemd detail, the install-time preflight, and the Linux linger step
+needed for it to survive reboot.
+
+**Step 2 — connect your agent.**
 
 ```sh
 salvager init
@@ -147,11 +161,27 @@ It connects your agent to Salvager with no JSON to copy by hand:
 something drifts and it repairs only what drifted. It only ever rewrites its own
 delimited block in `CLAUDE.md` and never touches `~/.claude.json` by hand. Flags:
 `--no-claude-md` (register the MCP server only) and `--undo` (remove both pieces).
-It does not start the watcher — that's the next step below.
 
 > Requires the `claude` CLI on your PATH for the MCP step. If it's missing, `init`
 > still updates `CLAUDE.md` and prints the exact command to run yourself. Only
 > Claude Code is supported for now.
+
+The two steps are independent — neither command fails if you run them in the other
+order. Watcher-first is the sensible sequence, not a hard requirement: turn the
+capture on, then tell the agent the net is there.
+
+Just trying it, or prefer to run the watcher yourself? `salvager watch` runs it in
+the foreground until you kill it (Ctrl-C):
+
+```sh
+salvager watch [--root <path>]
+```
+
+Zero configuration — run it in the root of any project. It records an initial
+revision of every tracked file on startup, then captures every change (debounced
+~300 ms) thereafter. `--root <path>` watches a tree other than the current
+directory; without it, the working directory is used. `service install` is the
+recommended default; this is the run-it-by-hand path.
 
 ```
 salvager init [--no-claude-md] [--undo]  connect this project's agent
@@ -164,15 +194,10 @@ salvager mcp                      start the MCP server (stdio)
 salvager gc [--max-age 7d] [--max-bytes 500M]  purge old revisions and cap store size
 ```
 
-Run `salvager watch` in the root of any project — zero configuration. It records
-an initial revision of every tracked file on startup, then captures every
-change (debounced ~300 ms) thereafter. `--root <path>` watches a tree other than
-the current directory; without it, the working directory is used.
-
 ### Run it persistently
 
-`salvager watch` runs until killed. To install it once and forget it — surviving
-terminal close and reboot — register it as a per-project service:
+`salvager service install` from Step 1 is the recommended way to run the watcher —
+installed once, it survives terminal close and reboot. Its companion subcommands:
 
 ```sh
 salvager service install     # start now + on every login/reboot
