@@ -13,6 +13,13 @@ go vet ./...
 go test ./...
 ```
 
+Enable the local guard hook once per clone (rejects commit messages carrying a
+CI-skip directive — see below):
+
+```sh
+git config core.hooksPath .githooks
+```
+
 ## Branches & PRs
 
 - Branch off `main`; open the PR against `main`.
@@ -45,5 +52,12 @@ Rules:
 - The only sanctioned use is the `sync-readme` job's own pin-bump commit in
   `.github/workflows/ci.yml`.
 
-A `pull_request` CI job (`guard-skip-token`) scans PR bodies and commit messages
-for these directives and fails the check if it finds one.
+Three layers guard against this:
+
+- **Local** — the `.githooks/commit-msg` hook rejects a directive at commit time
+  (enable with `git config core.hooksPath .githooks`).
+- **PR** — the `guard-skip-token` CI job scans the PR body and every commit
+  message and fails the check if it finds one.
+- **Post-release** — the `release-watchdog` workflow runs on a schedule and fails
+  if any `v*` tag has no published release (the symptom of a silently-skipped
+  release push).

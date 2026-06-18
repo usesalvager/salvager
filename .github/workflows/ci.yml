@@ -45,6 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Scan PR body and commit messages
+        shell: bash
         env:
           # Pass untrusted PR text via env, never inline ${{ }} in run — avoids
           # shell injection.
