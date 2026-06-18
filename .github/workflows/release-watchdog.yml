@@ -1,0 +1,53 @@
+name: Release watchdog
+
+# Catches the silent-skip failure mode from issue #21: a v* tag can end up with
+# no published Release when its push is skipped by a stray CI-skip directive in
+# the commit message — and nothing else alerts (no run, no error). This runs on a
+# schedule (and on demand) and fails loudly, listing any v* tag that lacks a
+# published release. A failed scheduled run notifies repo admins by email.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Every v* tag has a published release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reconcile tags against releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tags="$(gh api "repos/${REPO}/tags" --paginate --jq '.[].name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' || true)"
+          if [ -z "$tags" ]; then
+            echo "No v* tags found — nothing to check."
+            exit 0
+          fi
+          missing=""
+          for t in $tags; do
+            # Published (non-draft) release for this tag? Missing release → 404.
+            if draft="$(gh api "repos/${REPO}/releases/tags/${t}" --jq '.draft' 2>/dev/null)"; then
+              [ "$draft" = "true" ] && missing="${missing} ${t}(draft)"
+            else
+              missing="${missing} ${t}(no-release)"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::v* tag(s) without a published release:${missing}"
+            echo "A tag with no release usually means its push was skipped (issue #21)."
+            echo "Re-trigger by moving the tag onto a clean-message commit and re-pushing."
+            exit 1
+          fi
+          echo "All v* tags have a published release."
+          # Note: a tag pushed in the few minutes before a scheduled run, while its
+          # release pipeline is still building, could flag transiently; the next
+          # tick clears it. Re-run manually via workflow_dispatch to confirm.

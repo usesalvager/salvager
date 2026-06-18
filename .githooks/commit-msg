@@ -1,0 +1,17 @@
+#!/bin/sh
+# Reject commit messages that contain a CI-skip directive GitHub honors. Such a
+# directive rides into a squash-merge commit and silently skips CI/Release on
+# main and on any tag pointing at it (see CONTRIBUTING.md, issue #21).
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Intentional skip:        git commit --no-verify   (rare; the only sanctioned
+#                          use is the sync-readme job's own commit, made in CI)
+msg_file="$1"
+pattern='\[(skip ci|ci skip|no ci|skip actions|actions skip)\]|\*\*\*NO_CI\*\*\*'
+if grep -iEq "$pattern" "$msg_file"; then
+	echo "commit-msg: refusing — this message contains a CI-skip directive:" >&2
+	grep -iEn "$pattern" "$msg_file" >&2
+	echo "  These silently skip CI/Release on push and tag pushes (issue #21)." >&2
+	echo "  Rephrase it, or re-run with --no-verify if you truly mean to skip CI." >&2
+	exit 1
+fi
