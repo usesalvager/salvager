@@ -35,6 +35,42 @@ jobs:
       - name: Test
         run: go test ./...
 
+  guard-skip-token:
+    name: Guard against accidental CI-skip tokens
+    # PR-only guard. A CI-skip directive anywhere in the PR body or a commit
+    # message rides into the squash-merge commit and silently skips CI/Release
+    # on main — and on any tag pointing at that commit. pull_request is the one
+    # event that still fires regardless, so we catch it here. See issue #21.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scan PR body and commit messages
+        env:
+          # Pass untrusted PR text via env, never inline ${{ }} in run — avoids
+          # shell injection.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The directives GitHub honors to skip a run, as one alternation.
+          pattern='\[(skip ci|ci skip|no ci|skip actions|actions skip)\]|\*\*\*NO_CI\*\*\*'
+          found=0
+          if printf '%s' "${PR_BODY:-}" | grep -iEn "$pattern"; then
+            echo "::error::PR body contains a CI-skip directive (matched above). It would ride into the squash-merge commit and silently skip CI/Release. Rephrase it — see CONTRIBUTING.md."
+            found=1
+          fi
+          msgs="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate --jq '.[].commit.message')"
+          if printf '%s' "$msgs" | grep -iEn "$pattern"; then
+            echo "::error::A commit message in this PR contains a CI-skip directive (matched above). Reword the commit, or it will silently skip CI/Release after merge — see CONTRIBUTING.md."
+            found=1
+          fi
+          if [ "$found" -ne 0 ]; then
+            exit 1
+          fi
+          echo "No CI-skip directives found in the PR body or commit messages."
+
   create-release:
     name: Create release
     # Only on a v* tag, and only after CI succeeds. Runs exactly once (no
