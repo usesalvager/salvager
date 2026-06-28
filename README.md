@@ -190,6 +190,8 @@ salvager service install | uninstall | status [--json]  run the watcher as a ser
 salvager history <file>           list recorded versions of a file
 salvager show <file> <ts>         print the content of one version
 salvager restore <file> <ts>      restore a file to a version (reversible)
+salvager restore-at <ts> [path]   restore a set of files to a point in time
+salvager restore-at --undo        revert the last restore-at batch
 salvager mcp                      start the MCP server (stdio)
 salvager gc [--max-age 7d] [--max-bytes 500M]  purge old revisions and cap store size
 ```
@@ -228,6 +230,21 @@ salvager restore config.json 1718312445
 
 Timestamps printed by `history` are human-readable; the raw millisecond values
 (needed for `show`/`restore`) are listed underneath.
+
+When a whole set of files is wiped at once — an agent in another terminal runs
+`git clean -fd` / `git checkout -f` / `git reset --hard` and takes your uncommitted,
+untracked work with it — rewind them together instead of one `restore` per file:
+
+```
+salvager restore-at <timestamp-ms> [path]   # restore every tracked file under [path]
+                                            # to its state at or before that instant
+salvager restore-at --undo                  # revert the last restore-at batch
+```
+
+It is non-destructive: files created after that instant are left alone, a file whose
+state then was a deletion is left in place (never removed), and the batch records a
+per-file `pre-restore` so `--undo` puts everything back. `[path]` defaults to the whole
+tree.
 
 `salvager gc` drops revisions older than N days (default 7) and garbage-collects
 any object no longer referenced by any log. With `--max-bytes`, it also caps

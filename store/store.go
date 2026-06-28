@@ -161,6 +161,7 @@ type Store interface {
 	List(relPath string) ([]Revision, error)
 	Get(relPath string, ts int64) ([]byte, error)
 	Restore(relPath string, ts int64) (preRestoreTs int64, err error)
+	RestoreAt(relDir string, atMs int64) (batchStart, batchEnd int64, results []RestoreResult, err error)
 	GC(maxAge time.Duration) error
 	GCBySize(maxBytes int64) (finalBytes int64, err error)
 }
@@ -833,6 +834,245 @@ func (s *FS) restoreLocked(relPath, abs string, ts int64) (int64, error) {
 		return 0, err
 	}
 	return pre.Timestamp, nil
+}
+
+// RestoreResult is one file's outcome in a batch restore.
+type RestoreResult struct {
+	Path         string
+	RestoredToTs int64  // the revision restored (nearest <= atMs that still exists); 0 when no revision applied
+	PreRestoreTs int64  // safeguard taken before overwrite (this file's undo point); 0 when nothing was written
+	Action       string // one of the Action* constants below
+}
+
+// Batch-restore outcomes for RestoreResult.Action.
+const (
+	ActionRestored          = "restored"            // the file was overwritten with its <=atMs revision
+	ActionUnchanged         = "unchanged"           // disk already matched the point-in-time state; nothing written
+	ActionSkippedNoRevision = "skipped-no-revision" // no revision existed at or before atMs (file created later, or never seen)
+	ActionSkippedDeletion   = "skipped-deletion"    // the file's state at atMs was a deletion; left in place (non-destructive)
+)
+
+// fileHash streams the sha256 of the file at abs — the same content address the
+// object store uses — so a batch can tell whether disk already holds a revision's
+// bytes without restoring. A missing file yields ("", false, nil): it cannot
+// match any content revision, so the batch must bring it back.
+func fileHash(abs string) (string, bool, error) {
+	f, err := os.Open(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", false, err
+	}
+	return hex.EncodeToString(h.Sum(nil)), true, nil
+}
+
+// underDir reports whether relPath lives under relDir, matching TrackedUnder's
+// containment semantics: relDir "" or "." means the whole tree; otherwise relPath
+// must equal relDir (a single-file target) or sit beneath it.
+func underDir(relPath, relDir string) bool {
+	if relDir == "" || relDir == "." {
+		return true
+	}
+	return relPath == relDir || strings.HasPrefix(relPath, relDir+string(filepath.Separator))
+}
+
+// RestoreAt restores every tracked file under relDir to the revision current at or
+// before atMs, as one locked batch. relDir "" or "." means the whole tree.
+//
+// Non-destructive (MVP default, no --exact yet): a file with no revision at/before
+// atMs (created later, or never seen) is left untouched, and a file whose state at
+// atMs was a deletion is left in place rather than removed. Only files whose
+// <=atMs content differs from disk — including a file the agent's bad bulk command
+// deleted from disk while the store still holds it — are rewritten.
+//
+// GC interaction is honest: when the exact instant was garbage-collected the pick
+// lands on the nearest surviving revision <= atMs, reported in RestoreResult.RestoredToTs
+// so the caller can tell when it differs from atMs.
+//
+// Atomicity is stated honestly, NOT DB-grade all-or-nothing: the batch runs under a
+// single write lock, each rewritten file first records its own pre-restore safeguard,
+// and the returned window [batchStart, batchEnd] lets UndoRestoreAt revert exactly
+// this batch. If a file mid-batch fails, RestoreAt stops and returns the error WITH
+// the partial results; files already rewritten stay individually reversible via their
+// RestoreResult.PreRestoreTs.
+func (s *FS) RestoreAt(relDir string, atMs int64) (batchStart, batchEnd int64, results []RestoreResult, err error) {
+	// Containment is checked before ANY effect — rejecting both lexical escapes and
+	// symlinked intermediate components — so the batch can never touch a path outside
+	// the tree. The whole-tree case ("" / ".") is the root itself, already contained.
+	if relDir != "" && relDir != "." {
+		if _, e := s.resolveContained(relDir); e != nil {
+			return 0, 0, nil, e
+		}
+		relDir = filepath.Clean(relDir)
+	}
+	err = s.withWriteLock(func() error {
+		batchStart, batchEnd, results, err = s.restoreAtLocked(relDir, atMs)
+		return err
+	})
+	return batchStart, batchEnd, results, err
+}
+
+// restoreAtLocked is the body of RestoreAt; the caller holds the write lock. It
+// reuses restoreLocked (the lock-held single-file body) per file inside the one
+// lock — never the public Restore, which would re-lock per file.
+func (s *FS) restoreAtLocked(relDir string, atMs int64) (int64, int64, []RestoreResult, error) {
+	logs, err := s.allLogs()
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	sort.Strings(logs) // deterministic, path-ordered batch
+
+	batchStart := nowFunc()
+	var results []RestoreResult
+	var maxPre int64
+	for _, relPath := range logs {
+		if !underDir(relPath, relDir) {
+			continue
+		}
+		revs, err := s.readLog(relPath) // oldest-first
+		if err != nil {
+			return batchStart, batchEndOf(maxPre), results, err
+		}
+		// Latest revision with Timestamp <= atMs. revs is oldest-first, so the last
+		// match wins. If the exact instant was GC'd this lands on the nearest survivor.
+		var target *Revision
+		for i := range revs {
+			if revs[i].Timestamp <= atMs {
+				target = &revs[i]
+			}
+		}
+		if target == nil {
+			// Created after atMs, or never seen by atMs: leave untouched.
+			results = append(results, RestoreResult{Path: relPath, Action: ActionSkippedNoRevision})
+			continue
+		}
+
+		abs, err := s.resolveContained(relPath)
+		if err != nil {
+			return batchStart, batchEndOf(maxPre), results, err
+		}
+
+		if target.Label == LabelDelete {
+			// State at atMs was a deletion. Non-destructive: never remove the current
+			// file. If disk is already absent it matches; otherwise we leave it in place.
+			// TODO(restore-at): --exact mode would remove a file created after atMs and
+			// re-delete one whose <=atMs state was this deletion.
+			action := ActionSkippedDeletion
+			if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
+				action = ActionUnchanged
+			}
+			results = append(results, RestoreResult{Path: relPath, RestoredToTs: target.Timestamp, Action: action})
+			continue
+		}
+
+		// Content revision: rewrite only when disk differs from it (a deleted-on-disk
+		// file differs, so it is brought back).
+		diskHash, exists, err := fileHash(abs)
+		if err != nil {
+			return batchStart, batchEndOf(maxPre), results, err
+		}
+		if exists && diskHash == target.Hash {
+			results = append(results, RestoreResult{Path: relPath, RestoredToTs: target.Timestamp, Action: ActionUnchanged})
+			continue
+		}
+		preTs, err := s.restoreLocked(relPath, abs, target.Timestamp)
+		if err != nil {
+			// Mid-batch failure: stop loud. Already-rewritten files remain reversible
+			// via their recorded pre-restore; the partial results carry their undo points.
+			return batchStart, batchEndOf(maxPre), results, err
+		}
+		if preTs > maxPre {
+			maxPre = preTs
+		}
+		results = append(results, RestoreResult{
+			Path: relPath, RestoredToTs: target.Timestamp, PreRestoreTs: preTs, Action: ActionRestored,
+		})
+	}
+
+	batchEnd := nowFunc()
+	if maxPre > batchEnd {
+		batchEnd = maxPre // a clock that stalled can bump an append past now; keep all pre-restores in-window
+	}
+	return batchStart, batchEnd, results, nil
+}
+
+// batchEndOf returns a window end safe to report on an error path: at least the
+// largest pre-restore written so far, so the partial batch's undo points stay
+// inside [batchStart, batchEnd].
+func batchEndOf(maxPre int64) int64 {
+	end := nowFunc()
+	if maxPre > end {
+		return maxPre
+	}
+	return end
+}
+
+// UndoRestoreAt reverts exactly the files a prior RestoreAt batch rewrote, by
+// restoring each tracked file under relDir to its latest pre-restore revision whose
+// timestamp falls in the batch window [batchStart, batchEnd]. Because pre-restore
+// timestamps differ per file, the window — not a single scalar — is what selects
+// only this batch's files: a file with an unrelated, older pre-restore is not
+// disturbed. Reuses restoreLocked, so undo is itself reversible. One write lock for
+// the whole revert.
+//
+// Honest about deletions: undo restores each file to its pre-restore SNAPSHOT, and
+// like everything in salvager it never deletes. A file that was absent at batch time
+// (e.g. wiped by the bulk command, then brought back by RestoreAt) had its last
+// recorded content captured as the pre-restore safeguard, so undo returns that
+// content rather than re-removing the file — non-destructive both directions.
+func (s *FS) UndoRestoreAt(relDir string, batchStart, batchEnd int64) ([]RestoreResult, error) {
+	if relDir != "" && relDir != "." {
+		if _, e := s.resolveContained(relDir); e != nil {
+			return nil, e
+		}
+		relDir = filepath.Clean(relDir)
+	}
+	var results []RestoreResult
+	err := s.withWriteLock(func() error {
+		logs, err := s.allLogs()
+		if err != nil {
+			return err
+		}
+		sort.Strings(logs)
+		for _, relPath := range logs {
+			if !underDir(relPath, relDir) {
+				continue
+			}
+			revs, err := s.readLog(relPath)
+			if err != nil {
+				return err
+			}
+			var target *Revision
+			for i := range revs {
+				if revs[i].Label == LabelPreRestore &&
+					revs[i].Timestamp >= batchStart && revs[i].Timestamp <= batchEnd {
+					target = &revs[i] // oldest-first: keep the latest in-window pre-restore
+				}
+			}
+			if target == nil {
+				continue // not touched by this batch
+			}
+			abs, err := s.resolveContained(relPath)
+			if err != nil {
+				return err
+			}
+			preTs, err := s.restoreLocked(relPath, abs, target.Timestamp)
+			if err != nil {
+				return err
+			}
+			results = append(results, RestoreResult{
+				Path: relPath, RestoredToTs: target.Timestamp, PreRestoreTs: preTs, Action: ActionRestored,
+			})
+		}
+		return nil
+	})
+	return results, err
 }
 
 // TrackedUnder returns the relPaths of files the store already has history for
