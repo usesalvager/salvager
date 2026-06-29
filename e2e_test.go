@@ -663,6 +663,104 @@ func TestE2E_A10_2_RecoverUncommittedWorkGitCannot(t *testing.T) {
 	}
 }
 
+// --- restore-at batch + undo, end to end through the CLI ---
+
+// TestE2E_RestoreAtBatchAndUndo exercises the restore-at CLI wiring a single
+// store-level test cannot: parsing, the .salvager/last-restore-at window file,
+// `--undo` reading it, and the one-shot removal. Scenario: a watcher records two
+// files, a bulk command clobbers one and deletes the other AFTER a captured
+// instant, then one `restore-at <ts>` brings both back and `--undo` reverts it.
+func TestE2E_RestoreAtBatchAndUndo(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping watcher subprocess e2e in -short mode")
+	}
+	proj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proj, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	e2eStartWatch(t, proj)
+
+	goodA := []byte("good A content\n")
+	goodB := []byte("good B content\n")
+	if err := os.WriteFile(filepath.Join(proj, "a.txt"), goodA, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, "sub", "b.txt"), goodB, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until both initial revisions are recorded.
+	if !e2ePoll(t, 6*time.Second, func() bool {
+		return len(e2eReadLog(t, proj, "a.txt")) >= 1 && len(e2eReadLog(t, proj, "sub/b.txt")) >= 1
+	}) {
+		t.Fatal("watcher never recorded the initial revisions")
+	}
+
+	// Capture an instant at/after both initials (derived from the log, not the wall
+	// clock, so the point-in-time is exact relative to recorded revisions).
+	aInit := e2eReadLog(t, proj, "a.txt")[0].Ts
+	bInit := e2eReadLog(t, proj, "sub/b.txt")[0].Ts
+	atMs := aInit
+	if bInit > atMs {
+		atMs = bInit
+	}
+
+	// The destructive bulk command: clobber a.txt, delete sub/b.txt.
+	if err := os.WriteFile(filepath.Join(proj, "a.txt"), []byte("CLOBBERED\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(proj, "sub", "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until the watcher records the clobber (a rev after atMs) and the delete.
+	if !e2ePoll(t, 6*time.Second, func() bool {
+		aRevs := e2eReadLog(t, proj, "a.txt")
+		bRevs := e2eReadLog(t, proj, "sub/b.txt")
+		aClobbered := len(aRevs) > 0 && aRevs[len(aRevs)-1].Ts > atMs
+		bDeleted := len(bRevs) > 0 && bRevs[len(bRevs)-1].Label == "delete"
+		return aClobbered && bDeleted
+	}) {
+		t.Fatalf("watcher never recorded the destructive changes; a=%+v b=%+v",
+			e2eReadLog(t, proj, "a.txt"), e2eReadLog(t, proj, "sub/b.txt"))
+	}
+
+	// restore-at <atMs>: both files return to their pre-clobber state.
+	out, errOut, code := e2eRun(t, proj, "restore-at", strconv.FormatInt(atMs, 10))
+	if code != 0 {
+		t.Fatalf("restore-at exited %d\nstdout=%q\nstderr=%q", code, out, errOut)
+	}
+	if !strings.Contains(out, "restored") {
+		t.Errorf("restore-at output lacks a restored summary:\n%s", out)
+	}
+	if got, _ := os.ReadFile(filepath.Join(proj, "a.txt")); !bytes.Equal(got, goodA) {
+		t.Errorf("a.txt = %q, want %q", got, goodA)
+	}
+	if got, err := os.ReadFile(filepath.Join(proj, "sub", "b.txt")); err != nil || !bytes.Equal(got, goodB) {
+		t.Errorf("sub/b.txt = %q (err=%v), want %q (brought back)", got, err, goodB)
+	}
+	if _, err := os.Stat(filepath.Join(proj, ".salvager", "last-restore-at")); err != nil {
+		t.Errorf("last-restore-at window file not written: %v", err)
+	}
+
+	// --undo reverts a.txt to its pre-batch (clobbered) bytes and removes the window.
+	undoOut, undoErr, undoCode := e2eRun(t, proj, "restore-at", "--undo")
+	if undoCode != 0 {
+		t.Fatalf("restore-at --undo exited %d\nstdout=%q\nstderr=%q", undoCode, undoOut, undoErr)
+	}
+	if got, _ := os.ReadFile(filepath.Join(proj, "a.txt")); !bytes.Equal(got, []byte("CLOBBERED\n")) {
+		t.Errorf("after undo a.txt = %q, want CLOBBERED (pre-batch state)", got)
+	}
+	if _, err := os.Stat(filepath.Join(proj, ".salvager", "last-restore-at")); !os.IsNotExist(err) {
+		t.Errorf("last-restore-at should be removed after undo, stat err = %v", err)
+	}
+
+	// A second --undo is a friendly no-op.
+	out2, _, code2 := e2eRun(t, proj, "restore-at", "--undo")
+	if code2 != 0 || !strings.Contains(out2, "no restore-at batch to undo") {
+		t.Errorf("second --undo: code=%d out=%q, want friendly no-op", code2, out2)
+	}
+}
+
 func TestParseMaxBytes(t *testing.T) {
 	ok := []struct {
 		in   string

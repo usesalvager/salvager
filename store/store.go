@@ -839,7 +839,7 @@ func (s *FS) restoreLocked(relPath, abs string, ts int64) (int64, error) {
 // RestoreResult is one file's outcome in a batch restore.
 type RestoreResult struct {
 	Path         string
-	RestoredToTs int64  // the revision restored (nearest <= atMs that still exists); 0 when no revision applied
+	RestoredToTs int64  // the <=atMs revision identified: the one restored, or the deletion-state revision for a skipped-deletion; 0 only when no revision existed at/before atMs
 	PreRestoreTs int64  // safeguard taken before overwrite (this file's undo point); 0 when nothing was written
 	Action       string // one of the Action* constants below
 }
@@ -882,6 +882,20 @@ func underDir(relPath, relDir string) bool {
 	return relPath == relDir || strings.HasPrefix(relPath, relDir+string(filepath.Separator))
 }
 
+// cleanContainedDir verifies relDir is inside the tree — rejecting both lexical
+// escapes and symlinked intermediate components — and returns its cleaned form.
+// "" / "." (the whole tree, i.e. the already-contained root) pass through. Shared
+// by RestoreAt and UndoRestoreAt so the containment rule lives in one place.
+func (s *FS) cleanContainedDir(relDir string) (string, error) {
+	if relDir != "" && relDir != "." {
+		if _, e := s.resolveContained(relDir); e != nil {
+			return "", e
+		}
+		relDir = filepath.Clean(relDir)
+	}
+	return relDir, nil
+}
+
 // RestoreAt restores every tracked file under relDir to the revision current at or
 // before atMs, as one locked batch. relDir "" or "." means the whole tree.
 //
@@ -902,14 +916,11 @@ func underDir(relPath, relDir string) bool {
 // the partial results; files already rewritten stay individually reversible via their
 // RestoreResult.PreRestoreTs.
 func (s *FS) RestoreAt(relDir string, atMs int64) (batchStart, batchEnd int64, results []RestoreResult, err error) {
-	// Containment is checked before ANY effect — rejecting both lexical escapes and
-	// symlinked intermediate components — so the batch can never touch a path outside
-	// the tree. The whole-tree case ("" / ".") is the root itself, already contained.
-	if relDir != "" && relDir != "." {
-		if _, e := s.resolveContained(relDir); e != nil {
-			return 0, 0, nil, e
-		}
-		relDir = filepath.Clean(relDir)
+	// Containment is checked before ANY effect, so the batch can never touch a path
+	// outside the tree.
+	relDir, err = s.cleanContainedDir(relDir)
+	if err != nil {
+		return 0, 0, nil, err
 	}
 	err = s.withWriteLock(func() error {
 		batchStart, batchEnd, results, err = s.restoreAtLocked(relDir, atMs)
@@ -995,16 +1006,13 @@ func (s *FS) restoreAtLocked(relDir string, atMs int64) (int64, int64, []Restore
 		})
 	}
 
-	batchEnd := nowFunc()
-	if maxPre > batchEnd {
-		batchEnd = maxPre // a clock that stalled can bump an append past now; keep all pre-restores in-window
-	}
-	return batchStart, batchEnd, results, nil
+	return batchStart, batchEndOf(maxPre), results, nil
 }
 
-// batchEndOf returns a window end safe to report on an error path: at least the
-// largest pre-restore written so far, so the partial batch's undo points stay
-// inside [batchStart, batchEnd].
+// batchEndOf returns the batch window's end: now, but never below the largest
+// pre-restore written so far. A clock that stalled can bump an append past now
+// (appendLog forces strictly increasing timestamps), so clamping here keeps every
+// pre-restore — full batch or partial-on-error — inside [batchStart, batchEnd].
 func batchEndOf(maxPre int64) int64 {
 	end := nowFunc()
 	if maxPre > end {
@@ -1027,14 +1035,12 @@ func batchEndOf(maxPre int64) int64 {
 // recorded content captured as the pre-restore safeguard, so undo returns that
 // content rather than re-removing the file — non-destructive both directions.
 func (s *FS) UndoRestoreAt(relDir string, batchStart, batchEnd int64) ([]RestoreResult, error) {
-	if relDir != "" && relDir != "." {
-		if _, e := s.resolveContained(relDir); e != nil {
-			return nil, e
-		}
-		relDir = filepath.Clean(relDir)
+	relDir, err := s.cleanContainedDir(relDir)
+	if err != nil {
+		return nil, err
 	}
 	var results []RestoreResult
-	err := s.withWriteLock(func() error {
+	err = s.withWriteLock(func() error {
 		logs, err := s.allLogs()
 		if err != nil {
 			return err

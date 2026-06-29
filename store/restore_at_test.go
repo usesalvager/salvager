@@ -363,6 +363,196 @@ func TestRestoreAt_ContainmentRefused(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// Deletion-state branch: a file whose latest revision <= atMs is a deletion is
+// left in place (non-destructive), never removed.
+// -----------------------------------------------------------------------------
+
+func TestRestoreAt_DeletionStateBranch(t *testing.T) {
+	clock := fakeClock(t)
+	root := t.TempDir()
+	s := New(root)
+
+	// Both files: content then DELETED, all BEFORE atMs, so target.Label == delete.
+	for _, rel := range []string{"gone.txt", "staysGone.txt"} {
+		write(t, root, rel, "had content: "+rel)
+		if err := s.Record(rel); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(root, rel)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Record(rel); err != nil { // records a delete
+			t.Fatal(err)
+		}
+	}
+	atMs := atomic.LoadInt64(clock)
+
+	// gone.txt is re-created on disk AFTER atMs. Non-destructive: must be left intact.
+	write(t, root, "gone.txt", "RECREATED after atMs")
+	if err := s.Record("gone.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, results, err := s.RestoreAt("", atMs)
+	if err != nil {
+		t.Fatalf("RestoreAt: %v", err)
+	}
+	byPath := resultsByPath(results)
+
+	// (a) deletion-state + present on disk -> skipped-deletion, file untouched.
+	if byPath["gone.txt"].Action != ActionSkippedDeletion {
+		t.Errorf("gone.txt action = %q, want %q", byPath["gone.txt"].Action, ActionSkippedDeletion)
+	}
+	if g, ok := readDisk(t, root, "gone.txt"); !ok || g != "RECREATED after atMs" {
+		t.Errorf("gone.txt = %q (ok=%v), want left intact (never removed)", g, ok)
+	}
+	if byPath["gone.txt"].RestoredToTs == 0 {
+		t.Errorf("gone.txt RestoredToTs = 0, want the delete revision's ts")
+	}
+
+	// (b) deletion-state + absent on disk -> unchanged (already matches).
+	if byPath["staysGone.txt"].Action != ActionUnchanged {
+		t.Errorf("staysGone.txt action = %q, want %q", byPath["staysGone.txt"].Action, ActionUnchanged)
+	}
+	if _, ok := readDisk(t, root, "staysGone.txt"); ok {
+		t.Errorf("staysGone.txt should remain absent")
+	}
+	if byPath["staysGone.txt"].RestoredToTs == 0 {
+		t.Errorf("staysGone.txt RestoredToTs = 0, want the delete revision's ts")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// relDir scoping: a file outside relDir is untouched and absent from results; a
+// single-file relDir targets exactly that path.
+// -----------------------------------------------------------------------------
+
+func TestRestoreAt_RelDirScoping(t *testing.T) {
+	clock := fakeClock(t)
+	root := t.TempDir()
+	s := New(root)
+
+	files := []string{"sub/a.txt", "sub/deep/b.txt", "top.txt"}
+	for _, rel := range files {
+		write(t, root, rel, "orig:"+rel)
+		if err := s.Record(rel); err != nil {
+			t.Fatal(err)
+		}
+	}
+	atMs := atomic.LoadInt64(clock)
+	for _, rel := range files {
+		write(t, root, rel, "CLOB:"+rel)
+		if err := s.Record(rel); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Scope to sub/: both sub files rewound; top.txt absent from results, untouched.
+	_, _, results, err := s.RestoreAt("sub", atMs)
+	if err != nil {
+		t.Fatalf("RestoreAt(sub): %v", err)
+	}
+	byPath := resultsByPath(results)
+	for _, rel := range []string{"sub/a.txt", "sub/deep/b.txt"} {
+		if byPath[rel].Action != ActionRestored {
+			t.Errorf("%s action = %q, want restored", rel, byPath[rel].Action)
+		}
+		if g, _ := readDisk(t, root, rel); g != "orig:"+rel {
+			t.Errorf("%s disk = %q, want rewound", rel, g)
+		}
+	}
+	if _, in := byPath["top.txt"]; in {
+		t.Errorf("top.txt must not appear in results scoped to sub/")
+	}
+	if g, _ := readDisk(t, root, "top.txt"); g != "CLOB:top.txt" {
+		t.Errorf("top.txt disk = %q, want untouched (CLOB)", g)
+	}
+
+	// Single-file relDir: results contain exactly that one path (underDir equality).
+	_, _, single, err := s.RestoreAt("sub/deep/b.txt", atMs)
+	if err != nil {
+		t.Fatalf("RestoreAt(single): %v", err)
+	}
+	if len(single) != 1 || single[0].Path != "sub/deep/b.txt" {
+		t.Errorf("single-file target results = %+v, want exactly [sub/deep/b.txt]", single)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Selection lands on the nearest revision <= atMs when atMs falls in a gap — the
+// same observable behavior as a GC'd exact-instant revision. RestoredToTs reports
+// the shift (strictly before atMs).
+// -----------------------------------------------------------------------------
+
+func TestRestoreAt_PicksNearestRevisionBeforeAtMs(t *testing.T) {
+	clock := fakeClock(t)
+	root := t.TempDir()
+	s := New(root)
+
+	write(t, root, "a.txt", "early")
+	if err := s.Record("a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	earlyTs := atomic.LoadInt64(clock)
+
+	// A gap, then a later revision; atMs lands inside the gap.
+	atomic.AddInt64(clock, 1000)
+	write(t, root, "a.txt", "late")
+	if err := s.Record("a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	atMs := earlyTs + 500
+
+	write(t, root, "a.txt", "DISK")
+	if err := s.Record("a.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, results, err := s.RestoreAt("", atMs)
+	if err != nil {
+		t.Fatalf("RestoreAt: %v", err)
+	}
+	r := resultsByPath(results)["a.txt"]
+	if r.Action != ActionRestored {
+		t.Fatalf("action = %q, want restored", r.Action)
+	}
+	if r.RestoredToTs != earlyTs {
+		t.Errorf("RestoredToTs = %d, want earlyTs %d (nearest <= atMs)", r.RestoredToTs, earlyTs)
+	}
+	if r.RestoredToTs >= atMs {
+		t.Errorf("RestoredToTs %d not strictly before atMs %d; the shift is not observable", r.RestoredToTs, atMs)
+	}
+	if g, _ := readDisk(t, root, "a.txt"); g != "early" {
+		t.Errorf("disk = %q, want early", g)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Empty store: RestoreAt / UndoRestoreAt are clean no-ops, not errors.
+// -----------------------------------------------------------------------------
+
+func TestRestoreAt_EmptyTree(t *testing.T) {
+	fakeClock(t)
+	root := t.TempDir()
+	s := New(root)
+
+	bs, be, results, err := s.RestoreAt("", 999)
+	if err != nil {
+		t.Fatalf("RestoreAt on empty store: %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("results = %v, want empty", results)
+	}
+	undo, err := s.UndoRestoreAt("", bs, be)
+	if err != nil {
+		t.Fatalf("UndoRestoreAt on empty store: %v", err)
+	}
+	if len(undo) != 0 {
+		t.Errorf("undo results = %v, want empty", undo)
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Concurrency: restore-at vs a concurrent GC and writer (separate *FS = separate
 // processes) never tears a batch — one write lock serializes all three. Reuses
 // the cross-process dangling/timestamp scanners.
@@ -403,11 +593,14 @@ func TestCrossProcess_RestoreAtVsGCAndWriter(t *testing.T) {
 		}
 	}()
 
+	var restoreOK atomic.Int64 // completed-without-error count: rules out an always-erroring no-op
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for !stop.Load() {
-			_, _, _, _ = restorer.RestoreAt("dir", atMs)
+			if _, _, _, err := restorer.RestoreAt("dir", atMs); err == nil {
+				restoreOK.Add(1)
+			}
 		}
 	}()
 
@@ -433,6 +626,11 @@ func TestCrossProcess_RestoreAtVsGCAndWriter(t *testing.T) {
 		t.Fatalf("final ts scan: %v", err)
 	} else if len(bad) > 0 {
 		t.Fatalf("STORE CORRUPTED: %d timestamp-order violation(s):\n  %v", len(bad), bad)
+	}
+	// The restorer actually ran (not always erroring under contention); functional
+	// correctness of the batch itself is covered by the non-concurrent tests above.
+	if restoreOK.Load() == 0 {
+		t.Fatal("RestoreAt never completed successfully under contention")
 	}
 }
 

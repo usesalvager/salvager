@@ -248,9 +248,6 @@ func cmdRestoreAt(root string, args []string) {
 	// Print whatever the batch reached even on a mid-batch failure: the partial
 	// results name the files already rewritten (each still reversible).
 	printRestoreAtSummary(results, ts)
-	if err != nil {
-		fatal(err)
-	}
 
 	restored := 0
 	for _, r := range results {
@@ -258,16 +255,21 @@ func cmdRestoreAt(root string, args []string) {
 			restored++
 		}
 	}
+	// Persist the batch window BEFORE failing, so `restore-at --undo` can revert
+	// exactly what was rewritten — including a partial batch left by a mid-batch
+	// failure. A write failure here is non-fatal: the restore already happened.
+	if restored > 0 {
+		data := fmt.Sprintf("%d\t%d\t%s\n", batchStart, batchEnd, relDir)
+		if werr := os.WriteFile(lastRestoreAtFile(root), []byte(data), 0o600); werr != nil {
+			fmt.Fprintln(os.Stderr, "salvager: warning: could not save undo state:", werr)
+		}
+	}
+	if err != nil {
+		fatal(err) // the partial batch persisted above is revertible with: salvager restore-at --undo
+	}
 	if restored == 0 {
 		fmt.Println("✓ nothing to restore — no file differed from its state at that time.")
 		return
-	}
-	// Persist the window so --undo can revert exactly this batch. A failure here is
-	// non-fatal: the restore already happened; only the undo shortcut is lost (the
-	// per-file pre-restore timestamps printed above still undo it by hand).
-	data := fmt.Sprintf("%d\t%d\t%s\n", batchStart, batchEnd, relDir)
-	if err := os.WriteFile(lastRestoreAtFile(root), []byte(data), 0o600); err != nil {
-		fmt.Fprintln(os.Stderr, "salvager: warning: could not save undo state:", err)
 	}
 	fmt.Printf("✓ %d file(s) restored.  Undo this batch:  salvager restore-at --undo\n", restored)
 }
@@ -316,16 +318,12 @@ func cmdRestoreAtUndo(root string) {
 	fmt.Printf("✓ reverted %d file(s) to their pre-batch state.\n", len(results))
 }
 
-// printRestoreAtSummary prints one row per file: path, the human time of the
-// revision it landed on (shown so a GC-shifted target is visible), and the action.
-func printRestoreAtSummary(results []store.RestoreResult, atMs int64) {
-	if len(results) == 0 {
-		return
-	}
-	fmt.Printf("Restoring files to their state at or before %s…\n",
-		time.UnixMilli(atMs).Format("2006-01-02 15:04:05"))
+// printResultTable renders one row per file: path, the human time of the revision
+// it landed on (so a GC-shifted target, or the pre-restore an undo reverts to, is
+// visible), and the action. whenLabel names the middle column.
+func printResultTable(results []store.RestoreResult, whenLabel string) {
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PATH\tRESTORED TO\tACTION")
+	fmt.Fprintf(tw, "PATH\t%s\tACTION\n", whenLabel)
 	for _, r := range results {
 		when := "-"
 		if r.RestoredToTs != 0 {
@@ -336,17 +334,20 @@ func printRestoreAtSummary(results []store.RestoreResult, atMs int64) {
 	tw.Flush()
 }
 
+func printRestoreAtSummary(results []store.RestoreResult, atMs int64) {
+	if len(results) == 0 {
+		return
+	}
+	fmt.Printf("Restoring files to their state at or before %s…\n",
+		time.UnixMilli(atMs).Format("2006-01-02 15:04:05"))
+	printResultTable(results, "RESTORED TO")
+}
+
 func printUndoSummary(results []store.RestoreResult) {
 	if len(results) == 0 {
 		return
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "PATH\tREVERTED TO\tACTION")
-	for _, r := range results {
-		fmt.Fprintf(tw, "%s\t%s\t%s\n", r.Path,
-			time.UnixMilli(r.RestoredToTs).Format("2006-01-02 15:04:05"), r.Action)
-	}
-	tw.Flush()
+	printResultTable(results, "REVERTED TO")
 }
 
 func cmdMCP(root string) {
