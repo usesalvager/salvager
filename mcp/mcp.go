@@ -1,7 +1,7 @@
 // Package mcp exposes the store over the Model Context Protocol as a thin
-// layer: exactly three tools, all read or restore. No purge or delete is ever
-// exposed — the safety net must not be removable by the agent that might break
-// things.
+// layer: four tools, all read or restore. No purge or delete is ever exposed —
+// the safety net must not be removable by the agent that might break things, and
+// every restore is non-destructive (it saves a pre-restore safeguard first).
 package mcp
 
 import (
@@ -27,6 +27,7 @@ type Backend interface {
 	List(relPath string) ([]store.Revision, error)
 	Get(relPath string, ts int64) ([]byte, error)
 	Restore(relPath string, ts int64) (preRestoreTs int64, err error)
+	RestoreAt(relDir string, atMs int64) (batchStart, batchEnd int64, results []store.RestoreResult, err error)
 }
 
 // --- tool I/O types (json + jsonschema tags drive the wire schema) ---
@@ -79,6 +80,37 @@ type restoreInput struct {
 type restoreOutput struct {
 	OK                  bool  `json:"ok"`
 	PreRestoreTimestamp int64 `json:"pre_restore_timestamp"`
+}
+
+type restoreAtInput struct {
+	Timestamp int64  `json:"timestamp" jsonschema:"restore each file to its state at or before this millisecond timestamp"`
+	Path      string `json:"path,omitempty" jsonschema:"project-relative directory to limit the restore to; omit or \".\" for the whole project"`
+}
+
+// restoreAtFile is one file's outcome, mirroring store.RestoreResult on the wire.
+type restoreAtFile struct {
+	Path string `json:"path"`
+	// Action is one of: "restored", "unchanged", "skipped-no-revision",
+	// "skipped-deletion" (see store.Action* — the latter two are how the
+	// non-destructive contract is reported, not failures).
+	Action string `json:"action"`
+	// RestoredToTimestamp is the <=timestamp revision the file landed on; differs
+	// from the requested timestamp when that exact instant was garbage-collected.
+	RestoredToTimestamp int64 `json:"restored_to_timestamp,omitempty"`
+	// PreRestoreTimestamp is this file's undo point: salvager_restore <path> with
+	// it reverts just this file. 0 when nothing was written.
+	PreRestoreTimestamp int64 `json:"pre_restore_timestamp,omitempty"`
+}
+
+type restoreAtOutput struct {
+	OK            bool `json:"ok"`
+	RestoredCount int  `json:"restored_count"`
+	// BatchStart/BatchEnd bound the pre-restore timestamps this batch wrote — the
+	// window an undo would target. Returned for completeness; per-file undo uses
+	// each file's pre_restore_timestamp.
+	BatchStart int64           `json:"batch_start"`
+	BatchEnd   int64           `json:"batch_end"`
+	Files      []restoreAtFile `json:"files"`
 }
 
 func human(tsMillis int64) string {
@@ -166,6 +198,48 @@ func NewServer(b Backend) *mcp.Server {
 			return nil, restoreOutput{}, err
 		}
 		return nil, restoreOutput{OK: true, PreRestoreTimestamp: preTs}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "salvager_restore_at",
+		Description: "Point-in-time batch restore: rewind a whole SET of files at once to their state " +
+			"at or before a timestamp — the recovery for a bulk command that wiped or clobbered many " +
+			"files together (a parallel agent running `git clean -fd` / `git reset --hard` / `git checkout -f`). " +
+			"Restore them as one batch instead of one salvager_restore per file. " +
+			"`path` limits the restore to a project-relative subtree (omit for the whole project); `timestamp` " +
+			"is the instant to rewind to (use salvager_list_versions to find a good one — pick just BEFORE the damage). " +
+			"NON-DESTRUCTIVE: a file created after that instant is left untouched, a file whose state then was a " +
+			"deletion is left in place (never removed), and only files whose recorded content differs from disk are " +
+			"rewritten (including one the bad command deleted from disk — it is brought back). Each rewritten file " +
+			"first saves a pre_restore safeguard, so the whole batch is reversible: undo one file with salvager_restore " +
+			"using its pre_restore_timestamp. The result lists every file with its action and timestamps.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in restoreAtInput) (*mcp.CallToolResult, restoreAtOutput, error) {
+		start, end, results, err := b.RestoreAt(in.Path, in.Timestamp)
+		if err != nil {
+			// Honest atomicity: a mid-batch failure leaves the files restored so far
+			// individually reversible via their pre_restore safeguards, but the partial
+			// set is not returned here. Surface the error; recover per file with
+			// salvager_list_versions + salvager_restore.
+			return nil, restoreAtOutput{}, err
+		}
+		out := restoreAtOutput{
+			OK:         true,
+			BatchStart: start,
+			BatchEnd:   end,
+			Files:      make([]restoreAtFile, 0, len(results)),
+		}
+		for _, r := range results {
+			if r.Action == store.ActionRestored {
+				out.RestoredCount++
+			}
+			out.Files = append(out.Files, restoreAtFile{
+				Path:                r.Path,
+				Action:              r.Action,
+				RestoredToTimestamp: r.RestoredToTs,
+				PreRestoreTimestamp: r.PreRestoreTs,
+			})
+		}
+		return nil, out, nil
 	})
 
 	return s

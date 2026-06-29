@@ -40,6 +40,8 @@ UNCOMMITTED work, recover it yourself instead of giving up:
 - ` + "`salvager_list_versions`" + ` — list a file's saved revisions
 - ` + "`salvager_get_version`" + ` — read one revision's content (inspect before restoring)
 - ` + "`salvager_restore`" + ` — restore a revision (reversible: returns a pre-restore timestamp)
+- ` + "`salvager_restore_at`" + ` — rewind a SET of files to a point in time at once
+  (recovery for a bulk ` + "`git clean -fd`" + `/` + "`reset --hard`" + ` that wiped many files); non-destructive, reversible
 
 Reach for them when a file was overwritten, corrupted, or deleted and git has
 nothing staged to recover from.`
