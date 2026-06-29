@@ -153,14 +153,19 @@ salvager init
 It connects your agent to Salvager with no JSON to copy by hand:
 
 - registers the Salvager **MCP server** for this project in Claude Code (scope
-  *local* — private to you, never committed), via the `claude` CLI; and
+  *local* — private to you, never committed), via the `claude` CLI;
 - adds a short block to your **user** `~/.claude/CLAUDE.md` telling the agent the
-  Salvager tools exist and when to use them.
+  Salvager tools exist and when to use them; and
+- registers a **PreToolUse hook** in this project's `.claude/settings.local.json`
+  (scope local, never committed) so Salvager can intercept dangerous Bash commands
+  before they run — see [Interception (Tier A/B)](#interception-tier-ab).
 
 `init` is an idempotent reconciler: run it twice and nothing changes; run it after
 something drifts and it repairs only what drifted. It only ever rewrites its own
-delimited block in `CLAUDE.md` and never touches `~/.claude.json` by hand. Flags:
-`--no-claude-md` (register the MCP server only) and `--undo` (remove both pieces).
+delimited block in `CLAUDE.md`, merges its own entry into `settings.local.json`
+(preserving your other hooks and keys), and never touches `~/.claude.json` by hand.
+Flags: `--no-claude-md` (skip the CLAUDE.md block; the MCP server and hook still
+register) and `--undo` (remove all three pieces).
 
 > Requires the `claude` CLI on your PATH for the MCP step. If it's missing, `init`
 > still updates `CLAUDE.md` and prints the exact command to run yourself. Only
@@ -194,6 +199,7 @@ salvager restore-at <ts> [path]   restore a set of files to a point in time
 salvager restore-at --undo        revert the last restore-at batch
 salvager timeline [path]          show activity and flag destructive bursts
 salvager mcp                      start the MCP server (stdio)
+salvager hook                     Claude Code PreToolUse guard (invoked by Claude Code, not by hand)
 salvager gc [--max-age 7d] [--max-bytes 500M]  purge old revisions and cap store size
 ```
 
@@ -294,6 +300,38 @@ into another MCP client by hand, point it at the binary:
   }
 }
 ```
+
+## Interception (Tier A/B)
+
+Recovery is the net under the agent; interception is the rail in front of it. On
+Claude Code, `salvager init` also registers a **PreToolUse hook** (`salvager hook`,
+in `.claude/settings.local.json`) that inspects every Bash command *before* it
+runs. It is invoked by Claude Code, never by a human.
+
+The line it draws is the honest one — **what Salvager can vs cannot recover:**
+
+- **Tier A — denied.** Damage the file-history net cannot undo: deletion reaching
+  *outside* the project tree (`rm -rf ~`, `rm -rf /`, a `..` escape), destroying the
+  net itself (any write to `.salvager/`), or an irreversible-beyond-the-filesystem
+  write (`git push --force`, `dd`, `mkfs`, `shred`). The deny carries a reason the
+  agent reads and self-corrects on, in the same turn.
+- **Tier B — checkpointed, then allowed.** Destructive but recoverable *inside* the
+  tree (`git reset --hard`, `git clean -fd`, `git checkout -f`, bulk `sed -i` /
+  `find -delete` / `xargs rm`). Salvager lets it proceed and hands the agent the
+  `restore-at` instant to rewind to if it goes wrong.
+- **Everything else passes**, fast and silent.
+
+Salvager never blocks something it could have undone anyway — it only walls off
+what the net can't save. Crucially, PreToolUse hooks **fire and can block even when
+the agent runs with `--dangerously-skip-permissions`**, so a Tier A deny is the one
+guardrail a YOLO-mode agent cannot bypass. The hook always **fails open**: if it
+can't parse, classify, or errors, the command is allowed — a net must never become
+the thing that jams the tool it guards. Every Tier A/B attempt is appended to a
+local, append-only `.salvager/hook-log` (the command is hashed, never stored
+verbatim); nothing is uploaded.
+
+The classifier is an agent-agnostic core (`guard/`) behind a thin Claude Code
+adapter, so a second agent is a small adapter over the same, already-tested brain.
 
 ## How it works
 
