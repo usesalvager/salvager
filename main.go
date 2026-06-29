@@ -7,6 +7,7 @@
 //	salvager history <file>           list recorded versions of a file
 //	salvager show <file> <ts>         print the content of one version
 //	salvager restore <file> <ts>      restore a file to a version (reversible)
+//	salvager restore-at <ts> [path]   restore a set of files to a point in time
 //	salvager mcp                      start the MCP server (stdio)
 //	salvager gc [--max-age 7d] [--max-bytes 500M]
 //	                                  purge old revisions and cap store size
@@ -45,6 +46,8 @@ Usage:
   salvager history <file>           list recorded versions of a file
   salvager show <file> <timestamp>  print the content of one version
   salvager restore <file> <ts>      restore a file to a version (reversible)
+  salvager restore-at <ts> [path]   restore a set of files to a point in time
+  salvager restore-at --undo        revert the last restore-at batch
   salvager mcp                      start the MCP server (stdio)
   salvager gc [--max-age 7d] [--max-bytes 500M]
                                     purge old revisions and cap store size
@@ -75,6 +78,8 @@ func main() {
 		cmdShow(root, args)
 	case "restore":
 		cmdRestore(root, args)
+	case "restore-at":
+		cmdRestoreAt(root, args)
 	case "mcp":
 		cmdMCP(root)
 	case "gc":
@@ -214,6 +219,135 @@ func cmdRestore(root string, args []string) {
 	fmt.Printf("restored %s to revision %d\n", args[0], ts)
 	fmt.Printf("previous state saved as pre-restore revision %d (undo with: salvager restore %s %d)\n",
 		preTs, args[0], preTs)
+}
+
+// lastRestoreAtFile holds the window of the most recent restore-at batch so
+// `restore-at --undo` can target exactly it. It is internal state, not user
+// config, and lives inside .salvager/ — already outside the watched set.
+func lastRestoreAtFile(root string) string {
+	return filepath.Join(root, store.Dir, "last-restore-at")
+}
+
+func cmdRestoreAt(root string, args []string) {
+	if len(args) == 1 && args[0] == "--undo" {
+		cmdRestoreAtUndo(root)
+		return
+	}
+	if len(args) < 1 || len(args) > 2 {
+		fatalf("usage: salvager restore-at <timestamp-ms> [path]\n" +
+			"       salvager restore-at --undo")
+	}
+	ts := parseTS(args[0])
+	relDir := ""
+	if len(args) == 2 {
+		relDir = rel(root, args[1])
+	}
+
+	s := store.New(root)
+	batchStart, batchEnd, results, err := s.RestoreAt(relDir, ts)
+	// Print whatever the batch reached even on a mid-batch failure: the partial
+	// results name the files already rewritten (each still reversible).
+	printRestoreAtSummary(results, ts)
+
+	restored := 0
+	for _, r := range results {
+		if r.Action == store.ActionRestored {
+			restored++
+		}
+	}
+	// Persist the batch window BEFORE failing, so `restore-at --undo` can revert
+	// exactly what was rewritten — including a partial batch left by a mid-batch
+	// failure. A write failure here is non-fatal: the restore already happened.
+	if restored > 0 {
+		data := fmt.Sprintf("%d\t%d\t%s\n", batchStart, batchEnd, relDir)
+		if werr := os.WriteFile(lastRestoreAtFile(root), []byte(data), 0o600); werr != nil {
+			fmt.Fprintln(os.Stderr, "salvager: warning: could not save undo state:", werr)
+		}
+	}
+	if err != nil {
+		fatal(err) // the partial batch persisted above is revertible with: salvager restore-at --undo
+	}
+	if restored == 0 {
+		fmt.Println("✓ nothing to restore — no file differed from its state at that time.")
+		return
+	}
+	fmt.Printf("✓ %d file(s) restored.  Undo this batch:  salvager restore-at --undo\n", restored)
+}
+
+func cmdRestoreAtUndo(root string) {
+	b, err := os.ReadFile(lastRestoreAtFile(root))
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("no restore-at batch to undo")
+			return
+		}
+		fatal(err)
+	}
+	// Tab-separated: "<batchStart>\t<batchEnd>\t<relDir>". relDir may be empty (the
+	// whole tree) and may contain spaces, so it is the untouched remainder after the
+	// second tab. ponytail: a relDir containing a tab or newline would break this —
+	// pathological for a project path; upgrade to a length-prefixed encoding if ever needed.
+	line := strings.TrimRight(string(b), "\n")
+	parts := strings.SplitN(line, "\t", 3)
+	if len(parts) < 2 {
+		fatalf("corrupt undo state in %s", lastRestoreAtFile(root))
+	}
+	start, err1 := strconv.ParseInt(parts[0], 10, 64)
+	end, err2 := strconv.ParseInt(parts[1], 10, 64)
+	if err1 != nil || err2 != nil {
+		fatalf("corrupt undo state in %s", lastRestoreAtFile(root))
+	}
+	relDir := ""
+	if len(parts) == 3 {
+		relDir = parts[2]
+	}
+
+	s := store.New(root)
+	results, err := s.UndoRestoreAt(relDir, start, end)
+	printUndoSummary(results)
+	if err != nil {
+		fatal(err)
+	}
+	if len(results) == 0 {
+		fmt.Println("✓ nothing to undo — the last batch left no reversible files.")
+		return
+	}
+	// One-shot: drop the window so a second --undo is a friendly no-op (the undo
+	// itself is reversible per file via the pre-restore timestamps printed above).
+	_ = os.Remove(lastRestoreAtFile(root))
+	fmt.Printf("✓ reverted %d file(s) to their pre-batch state.\n", len(results))
+}
+
+// printResultTable renders one row per file: path, the human time of the revision
+// it landed on (so a GC-shifted target, or the pre-restore an undo reverts to, is
+// visible), and the action. whenLabel names the middle column.
+func printResultTable(results []store.RestoreResult, whenLabel string) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(tw, "PATH\t%s\tACTION\n", whenLabel)
+	for _, r := range results {
+		when := "-"
+		if r.RestoredToTs != 0 {
+			when = time.UnixMilli(r.RestoredToTs).Format("2006-01-02 15:04:05")
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", r.Path, when, r.Action)
+	}
+	tw.Flush()
+}
+
+func printRestoreAtSummary(results []store.RestoreResult, atMs int64) {
+	if len(results) == 0 {
+		return
+	}
+	fmt.Printf("Restoring files to their state at or before %s…\n",
+		time.UnixMilli(atMs).Format("2006-01-02 15:04:05"))
+	printResultTable(results, "RESTORED TO")
+}
+
+func printUndoSummary(results []store.RestoreResult) {
+	if len(results) == 0 {
+		return
+	}
+	printResultTable(results, "REVERTED TO")
 }
 
 func cmdMCP(root string) {
