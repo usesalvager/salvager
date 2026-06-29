@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/usesalvager/salvager/store"
@@ -564,7 +565,7 @@ func TestMCP_SharedStore_StoreWritesVisibleViaMCP(t *testing.T) {
 
 // A8.5 — EXACTLY 3 tools, none destructive. Security invariant: the agent that
 // might break things must not be able to delete/purge/gc its own safety net.
-func TestMCP_ExactlyThreeReadOrRestoreTools(t *testing.T) {
+func TestMCP_ExactlyFourReadOrRestoreTools(t *testing.T) {
 	ctx := context.Background()
 	s, _ := mcpSeedStore(t)
 
@@ -574,19 +575,19 @@ func TestMCP_ExactlyThreeReadOrRestoreTools(t *testing.T) {
 		t.Fatalf("ListTools: %v", err)
 	}
 
-	if len(lt.Tools) != 3 {
+	if len(lt.Tools) != 4 {
 		var names []string
 		for _, tool := range lt.Tools {
 			names = append(names, tool.Name)
 		}
-		t.Fatalf("want exactly 3 tools, got %d: %v", len(lt.Tools), names)
+		t.Fatalf("want exactly 4 tools, got %d: %v", len(lt.Tools), names)
 	}
 
 	got := map[string]bool{}
 	for _, tool := range lt.Tools {
 		got[tool.Name] = true
 	}
-	want := []string{"salvager_list_versions", "salvager_get_version", "salvager_restore"}
+	want := []string{"salvager_list_versions", "salvager_get_version", "salvager_restore", "salvager_restore_at"}
 	for _, w := range want {
 		if !got[w] {
 			t.Errorf("missing expected tool %q (have %v)", w, keysOf(got))
@@ -602,6 +603,133 @@ func TestMCP_ExactlyThreeReadOrRestoreTools(t *testing.T) {
 				t.Errorf("tool %q implies a destructive operation (%q) — must not be exposed", name, bad)
 			}
 		}
+	}
+}
+
+// salvager_restore_at recovers a SET of files clobbered by a bulk command in one
+// call: it rewinds each to its <=timestamp state, is non-destructive (a file
+// created after the instant is left untouched), and every rewritten file stays
+// individually reversible via its pre_restore_timestamp.
+func TestMCP_RestoreAt_BatchRecoversNonDestructiveAndReversible(t *testing.T) {
+	ctx := context.Background()
+	s, root := mcpSeedStore(t)
+
+	goodA := []byte("good A\n")
+	goodB := []byte("good B\n")
+	mcpWrite(t, root, "a.txt", goodA)
+	if err := s.Record("a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	mcpWrite(t, root, "sub/b.txt", goodB)
+	if err := s.Record("sub/b.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The instant to rewind to: at/after both initial revisions, before the damage.
+	aRevs, _ := s.List("a.txt")
+	bRevs, _ := s.List("sub/b.txt")
+	aInit := aRevs[0].Timestamp
+	bInit := bRevs[0].Timestamp
+	atMs := aInit
+	if bInit > atMs {
+		atMs = bInit
+	}
+	// Real clock (no fake in package mcp): guarantee the damage lands on a strictly
+	// later millisecond so atMs cannot accidentally include it.
+	time.Sleep(3 * time.Millisecond)
+
+	// The bulk command: clobber a.txt, delete sub/b.txt, and create c.txt fresh.
+	mcpWrite(t, root, "a.txt", []byte("CLOBBERED\n"))
+	if err := s.Record("a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "sub", "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Record("sub/b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	mcpWrite(t, root, "c.txt", []byte("created later\n"))
+	if err := s.Record("c.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	cs := mcpClientFor(t, s)
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "salvager_restore_at",
+		Arguments: map[string]any{"timestamp": atMs},
+	})
+	if err != nil {
+		t.Fatalf("CallTool restore_at: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error result: %s", mcpResultJSON(t, res))
+	}
+
+	var out restoreAtOutput
+	if err := json.Unmarshal(mcpResultJSON(t, res), &out); err != nil {
+		t.Fatalf("decode restore_at output: %v\n%s", err, mcpResultJSON(t, res))
+	}
+	if !out.OK || out.RestoredCount != 2 {
+		t.Fatalf("out.OK=%v RestoredCount=%d, want true/2: %+v", out.OK, out.RestoredCount, out)
+	}
+
+	byPath := map[string]restoreAtFile{}
+	for _, f := range out.Files {
+		byPath[f.Path] = f
+	}
+	if byPath["a.txt"].Action != store.ActionRestored || byPath["sub/b.txt"].Action != store.ActionRestored {
+		t.Errorf("a/b actions = %q/%q, want restored", byPath["a.txt"].Action, byPath["sub/b.txt"].Action)
+	}
+	// Non-destructive: c.txt had no revision at/before atMs → left untouched.
+	if byPath["c.txt"].Action != store.ActionSkippedNoRevision {
+		t.Errorf("c.txt action = %q, want %q", byPath["c.txt"].Action, store.ActionSkippedNoRevision)
+	}
+	if byPath["a.txt"].PreRestoreTimestamp == 0 {
+		t.Errorf("a.txt pre_restore_timestamp = 0, want non-zero undo point")
+	}
+
+	// Disk reflects the rewind: a back to good, b brought back, c untouched.
+	if got, _ := os.ReadFile(filepath.Join(root, "a.txt")); string(got) != string(goodA) {
+		t.Errorf("a.txt = %q, want %q", got, goodA)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "sub", "b.txt")); err != nil || string(got) != string(goodB) {
+		t.Errorf("sub/b.txt = %q (err=%v), want %q (brought back)", got, err, goodB)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "c.txt")); string(got) != "created later\n" {
+		t.Errorf("c.txt = %q, want untouched", got)
+	}
+
+	// Reversible: salvager_restore a.txt to its pre_restore_timestamp restores the
+	// clobbered bytes — proving the batch's per-file undo point is real.
+	undo, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "salvager_restore",
+		Arguments: map[string]any{"file": "a.txt", "timestamp": byPath["a.txt"].PreRestoreTimestamp},
+	})
+	if err != nil || undo.IsError {
+		t.Fatalf("undo restore failed: err=%v result=%s", err, mcpResultJSON(t, undo))
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, "a.txt")); string(got) != "CLOBBERED\n" {
+		t.Errorf("after per-file undo a.txt = %q, want CLOBBERED", got)
+	}
+}
+
+// A path that escapes the project tree is refused before any effect — same
+// containment guarantee as the single-file tools.
+func TestMCP_RestoreAt_PathEscapeRefused(t *testing.T) {
+	ctx := context.Background()
+	s, _ := mcpSeedStore(t)
+
+	cs := mcpClientFor(t, s)
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "salvager_restore_at",
+		Arguments: map[string]any{"timestamp": int64(1), "path": "../escape"},
+	})
+	if err != nil {
+		t.Fatalf("transport error (want a tool IsError result instead): %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("expected IsError for an escaping path, got success: %s", mcpResultJSON(t, res))
 	}
 }
 

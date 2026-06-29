@@ -255,14 +255,17 @@ day.
 
 ## MCP
 
-`salvager mcp` exposes exactly three tools over stdio:
+`salvager mcp` exposes four tools over stdio:
 
 - `salvager_list_versions` — list a file's versions (read-only)
 - `salvager_get_version` — read one version's content (inspect before acting)
 - `salvager_restore` — restore a version (returns the pre-restore timestamp)
+- `salvager_restore_at` — point-in-time batch restore: rewind a whole set of
+  files at once, for a bulk command that wiped many together (non-destructive;
+  each rewritten file carries its own pre-restore timestamp to undo)
 
 No purge or delete is exposed over MCP — the safety net can't be erased by the
-agent that might break things. Every tool is also contained to the project root:
+agent that might break things, and every restore is non-destructive. Every tool is also contained to the project root:
 a `file` argument that escapes the tree is refused before any read or write (see
 [architecture](docs/architecture.md#mcp-path-containment)).
 
