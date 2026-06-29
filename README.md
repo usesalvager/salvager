@@ -192,6 +192,7 @@ salvager show <file> <ts>         print the content of one version
 salvager restore <file> <ts>      restore a file to a version (reversible)
 salvager restore-at <ts> [path]   restore a set of files to a point in time
 salvager restore-at --undo        revert the last restore-at batch
+salvager timeline [path]          show activity and flag destructive bursts
 salvager mcp                      start the MCP server (stdio)
 salvager gc [--max-age 7d] [--max-bytes 500M]  purge old revisions and cap store size
 ```
@@ -245,6 +246,20 @@ It is non-destructive: files created after that instant are left alone, a file w
 state then was a deletion is left in place (never removed), and the batch records a
 per-file `pre-restore` so `--undo` puts everything back. `[path]` defaults to the whole
 tree.
+
+Not sure *which* instant to rewind to? `salvager timeline [path]` reads the recorded
+history (creating nothing) and flags clusters of destructive revisions — many files
+deleted or sharply shrunk within a couple of seconds, the fingerprint of a bulk
+`git clean -fd` / `reset --hard` — printing the exact `restore-at` command to undo each:
+
+```
+salvager timeline            # whole tree
+salvager timeline src        # just one subtree
+
+⚠ 1 likely-destructive burst(s):
+  2026-06-29 14:21:07  —  12 file(s) hit (12 deleted) within 30ms
+    rewind to just before:  salvager restore-at 1782693666999
+```
 
 `salvager gc` drops revisions older than N days (default 7) and garbage-collects
 any object no longer referenced by any log. With `--max-bytes`, it also caps

@@ -8,6 +8,7 @@
 //	salvager show <file> <ts>         print the content of one version
 //	salvager restore <file> <ts>      restore a file to a version (reversible)
 //	salvager restore-at <ts> [path]   restore a set of files to a point in time
+//	salvager timeline [path]          show activity and flag destructive bursts
 //	salvager mcp                      start the MCP server (stdio)
 //	salvager gc [--max-age 7d] [--max-bytes 500M]
 //	                                  purge old revisions and cap store size
@@ -48,6 +49,7 @@ Usage:
   salvager restore <file> <ts>      restore a file to a version (reversible)
   salvager restore-at <ts> [path]   restore a set of files to a point in time
   salvager restore-at --undo        revert the last restore-at batch
+  salvager timeline [path]          show activity and flag destructive bursts
   salvager mcp                      start the MCP server (stdio)
   salvager gc [--max-age 7d] [--max-bytes 500M]
                                     purge old revisions and cap store size
@@ -80,6 +82,8 @@ func main() {
 		cmdRestore(root, args)
 	case "restore-at":
 		cmdRestoreAt(root, args)
+	case "timeline":
+		cmdTimeline(root, args)
 	case "mcp":
 		cmdMCP(root)
 	case "gc":
@@ -348,6 +352,70 @@ func printUndoSummary(results []store.RestoreResult) {
 		return
 	}
 	printResultTable(results, "REVERTED TO")
+}
+
+// cmdTimeline is read-only: it scans the recorded history and flags clusters of
+// destructive revisions (the fingerprint of a bulk `git clean -fd`/`reset
+// --hard`/`checkout -f`), printing the exact `restore-at` command to rewind each
+// one. It creates nothing.
+func cmdTimeline(root string, args []string) {
+	relDir := ""
+	if len(args) == 1 {
+		relDir = rel(root, args[0])
+	} else if len(args) > 1 {
+		fatalf("usage: salvager timeline [path]")
+	}
+
+	s := store.New(root)
+	events, err := s.ScanRevisions(relDir)
+	if err != nil {
+		fatal(err)
+	}
+	if len(events) == 0 {
+		fmt.Println("no history yet")
+		return
+	}
+
+	files := map[string]bool{}
+	for _, e := range events {
+		files[e.Path] = true
+	}
+	fmt.Printf("%d revision(s) across %d file(s), %s → %s\n\n",
+		len(events), len(files),
+		time.UnixMilli(events[0].Timestamp).Format("2006-01-02 15:04:05"),
+		time.UnixMilli(events[len(events)-1].Timestamp).Format("2006-01-02 15:04:05"))
+
+	// pathArg scopes the suggested restore-at to the same subtree the user asked
+	// about, so the printed command rewinds only what the timeline reported.
+	pathArg := ""
+	if relDir != "" && relDir != "." {
+		pathArg = " " + relDir
+	}
+
+	bursts := store.DetectBursts(events)
+	if len(bursts) == 0 {
+		fmt.Println("✓ no destructive bursts detected.")
+		return
+	}
+
+	fmt.Printf("⚠ %d likely-destructive burst(s):\n\n", len(bursts))
+	for _, b := range bursts {
+		span := time.Duration(b.End-b.Start) * time.Millisecond
+		fmt.Printf("  %s  —  %d file(s) hit (%d deleted) within %s\n",
+			time.UnixMilli(b.Start).Format("2006-01-02 15:04:05"),
+			len(b.Files), b.Deletes, span)
+		shown := b.Files
+		if len(shown) > 5 {
+			shown = shown[:5]
+		}
+		for _, f := range shown {
+			fmt.Printf("      %s\n", f)
+		}
+		if len(b.Files) > len(shown) {
+			fmt.Printf("      … and %d more\n", len(b.Files)-len(shown))
+		}
+		fmt.Printf("    rewind to just before:  salvager restore-at %d%s\n\n", b.RestoreAt, pathArg)
+	}
 }
 
 func cmdMCP(root string) {
