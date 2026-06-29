@@ -376,15 +376,19 @@ reproducible external harness in `bench/`, not patched into the watcher.
 
 ## Scope (v1)
 
-In: one-command onboarding (`init`: MCP registration + user CLAUDE.md, idempotent,
-reversible), watcher, per-file store, list/get/restore/record, pre-restore safeguard,
-polling sweep for over-cap subtrees (automatic full coverage) + `--allow-partial`
-degradation policy, `.gitignore` + default excludes, CLI, MCP (3 tools),
-age- and size-based retention (always keeps each file's latest revision, never
-breaks a restore), external lightness/scaling benchmark harness (`bench/`).
+In: one-command onboarding (`init`: MCP registration + user CLAUDE.md + PreToolUse
+hook, idempotent, reversible), watcher, per-file store, list/get/restore/record,
+point-in-time batch restore (`restore-at`) + `timeline`, pre-restore safeguard,
+PreToolUse interception (Tier A deny / Tier B checkpoint, fail-open, agent-agnostic
+`guard` core + Claude Code adapter), polling sweep for over-cap subtrees (automatic
+full coverage) + `--allow-partial` degradation policy, `.gitignore` + default
+excludes, CLI, MCP (4 tools), age- and size-based retention (always keeps each
+file's latest revision, never breaks a restore), external lightness/scaling
+benchmark harness (`bench/`).
 
 Out: branches, merge, sync, cloud, accounts, config files, web UI, RBAC,
-rendered diffs, explicit checkpoints.
+rendered diffs, user-created explicit checkpoints (Tier B references the watcher's
+continuous recovery point, it does not store a named snapshot).
 
 ## License
 
