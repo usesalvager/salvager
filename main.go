@@ -10,6 +10,8 @@
 //	salvager restore-at <ts> [path]   restore a set of files to a point in time
 //	salvager timeline [path]          show activity and flag destructive bursts
 //	salvager mcp                      start the MCP server (stdio)
+//	salvager hook                     Claude Code PreToolUse guard (reads stdin;
+//	                                  invoked by Claude Code, not by a human)
 //	salvager gc [--max-age 7d] [--max-bytes 500M]
 //	                                  purge old revisions and cap store size
 package main
@@ -51,6 +53,8 @@ Usage:
   salvager restore-at --undo        revert the last restore-at batch
   salvager timeline [path]          show activity and flag destructive bursts
   salvager mcp                      start the MCP server (stdio)
+  salvager hook                     Claude Code PreToolUse guard (reads stdin;
+                                    invoked by Claude Code, not by a human)
   salvager gc [--max-age 7d] [--max-bytes 500M]
                                     purge old revisions and cap store size
 `
@@ -86,6 +90,8 @@ func main() {
 		cmdTimeline(root, args)
 	case "mcp":
 		cmdMCP(root)
+	case "hook":
+		cmdHook(root)
 	case "gc":
 		cmdGC(root, args)
 	case "--version", "-version", "version":
