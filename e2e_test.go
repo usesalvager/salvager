@@ -761,6 +761,62 @@ func TestE2E_RestoreAtBatchAndUndo(t *testing.T) {
 	}
 }
 
+// TestE2E_Timeline drives a destructive bulk delete past the live watcher and
+// asserts `salvager timeline` flags it as a burst with an actionable restore-at.
+func TestE2E_Timeline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping watcher subprocess e2e in -short mode")
+	}
+	proj := t.TempDir()
+	e2eStartWatch(t, proj)
+
+	names := []string{"a.txt", "b.txt", "c.txt"}
+	for _, n := range names {
+		if err := os.WriteFile(filepath.Join(proj, n), []byte("content of "+n+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !e2ePoll(t, 6*time.Second, func() bool {
+		for _, n := range names {
+			if len(e2eReadLog(t, proj, n)) < 1 {
+				return false
+			}
+		}
+		return true
+	}) {
+		t.Fatal("watcher never recorded the initial revisions")
+	}
+
+	// The destructive bulk command: delete every file at once.
+	for _, n := range names {
+		if err := os.Remove(filepath.Join(proj, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !e2ePoll(t, 6*time.Second, func() bool {
+		for _, n := range names {
+			revs := e2eReadLog(t, proj, n)
+			if len(revs) == 0 || revs[len(revs)-1].Label != "delete" {
+				return false
+			}
+		}
+		return true
+	}) {
+		t.Fatal("watcher never recorded the deletions")
+	}
+
+	out, errOut, code := e2eRun(t, proj, "timeline")
+	if code != 0 {
+		t.Fatalf("timeline exited %d\nstdout=%q\nstderr=%q", code, out, errOut)
+	}
+	if !strings.Contains(out, "revision(s) across") {
+		t.Errorf("timeline lacks the activity header:\n%s", out)
+	}
+	if !strings.Contains(out, "burst") || !strings.Contains(out, "restore-at ") {
+		t.Errorf("timeline did not flag the delete burst with a restore-at hint:\n%s", out)
+	}
+}
+
 func TestParseMaxBytes(t *testing.T) {
 	ok := []struct {
 		in   string
