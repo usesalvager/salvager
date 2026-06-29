@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -9,7 +11,7 @@ import (
 	"strings"
 )
 
-// salvager init is an idempotent reconciler with two independent pieces:
+// salvager init is an idempotent reconciler with three independent pieces:
 //
 //  1. the MCP server registration in Claude Code (scope local), driven entirely
 //     through the `claude` CLI — we never touch ~/.claude.json by hand, because
@@ -17,6 +19,9 @@ import (
 //     user their config before.
 //  2. a delimited block in the USER CLAUDE.md (~/.claude/CLAUDE.md) that teaches
 //     the agent which Salvager tools exist and when to reach for them.
+//  3. a PreToolUse hook in the project's .claude/settings.local.json (scope local,
+//     never committed) so Salvager can intercept-before, not only recover-after.
+//     Hooks live in SETTINGS files, never in ~/.claude.json.
 //
 // Each piece detects its own state and completes only what is missing; running
 // init twice changes nothing, and running it after drift repairs only the drifted
@@ -44,7 +49,13 @@ UNCOMMITTED work, recover it yourself instead of giving up:
   (recovery for a bulk ` + "`git clean -fd`" + `/` + "`reset --hard`" + ` that wiped many files); non-destructive, reversible
 
 Reach for them when a file was overwritten, corrupted, or deleted and git has
-nothing staged to recover from.`
+nothing staged to recover from.
+
+Salvager also guards your shell. If a Bash command is **denied by Salvager**,
+read the reason and adjust — it blocks only what the net cannot recover (e.g.
+` + "`rm -rf`" + ` reaching outside the project, or writing to ` + "`.salvager/`" + `). For a
+risky-but-recoverable command it instead leaves a recovery point; if one breaks
+the tree, rewind with ` + "`salvager restore-at`" + ` (or ` + "`salvager timeline`" + ` to find the instant).`
 
 // desiredBlock is the exact start..end region init writes.
 func desiredBlock() string {
@@ -129,6 +140,9 @@ func runInit(env *initEnv, noClaudeMD bool) {
 	if !noClaudeMD {
 		results = append(results, reconcileClaudeMD(env))
 	}
+	// The hook is independent of --no-claude-md (that flag scopes the CLAUDE.md
+	// teaching block only); the interceptor is always reconciled.
+	results = append(results, reconcileHook(env))
 	report(env, env.root, results, false)
 }
 
@@ -139,6 +153,7 @@ func runUndo(env *initEnv, noClaudeMD bool) {
 	if !noClaudeMD {
 		results = append(results, undoClaudeMD(env))
 	}
+	results = append(results, undoHook(env))
 	report(env, env.root, results, true)
 }
 
@@ -440,6 +455,272 @@ func atomicWrite(path string, data []byte) error {
 		mode = fi.Mode().Perm()
 	}
 	return writeFileAtomic(path, data, mode)
+}
+
+// --- PreToolUse hook piece -------------------------------------------------
+//
+// The hook entry is reconciled into .claude/settings.local.json in the project
+// root — private, per-user, git-ignored by Claude Code convention, the same
+// "scope local, never committed" choice init makes for the MCP server. Hooks
+// belong in settings files; ~/.claude.json is never hand-edited.
+//
+// The JSON merge is the careful part: read the file, preserve every other key and
+// every other hook, add Salvager's entry only if an equivalent one is not already
+// present (matched on the command), write atomically. Running twice changes
+// nothing; --undo removes exactly Salvager's entry and nothing else; a malformed
+// file degrades safe (left untouched, manual snippet printed), mirroring
+// reconcileMCP.
+//
+// TODO(hook): protected-paths layer (C2) — an Edit/Write matcher guarding
+// user-declared untouchable files. Needs its own config-surface decision.
+// Deferred seam: a --project-hook flag would write the committed
+// .claude/settings.json instead, for teams that want it shared.
+
+func settingsLocalPath(root string) string {
+	return filepath.Join(root, ".claude", "settings.local.json")
+}
+
+// hookCommand is the exact command string Salvager registers. The exe path is
+// left symlink-unresolved for the same reason as the MCP registration (a Homebrew
+// upgrade must not break it).
+func hookCommand(exePath string) string { return exePath + " hook" }
+
+func manualHookSnippet(exePath string) string {
+	return fmt.Sprintf(`add under hooks.PreToolUse a {"matcher":"Bash","hooks":[`+
+		`{"type":"command","command":%q,"timeout":5}]} entry`, hookCommand(exePath))
+}
+
+// desiredHookBlock is the matcher block Salvager owns.
+func desiredHookBlock(exePath string) map[string]any {
+	return map[string]any{
+		"matcher": "Bash",
+		"hooks": []any{
+			map[string]any{"type": "command", "command": hookCommand(exePath), "timeout": 5},
+		},
+	}
+}
+
+func reconcileHook(env *initEnv) pieceResult {
+	r := pieceResult{label: "PreToolUse"}
+	path := settingsLocalPath(env.root)
+
+	settings, ok, err := readSettings(path)
+	if err != nil {
+		r.ok = false
+		r.state = "could not read"
+		r.detail = err.Error()
+		return r
+	}
+	if !ok {
+		// File exists but is not valid JSON: degrade safe, never overwrite it.
+		r.ok = false
+		r.state = "skipped — settings.local.json is not valid JSON"
+		r.detail = "left untouched; " + manualHookSnippet(env.exePath)
+		return r
+	}
+
+	pre := preToolUseBlocks(settings)
+	hasCorrect, hasWrong := salvagerHookState(pre, env.exePath)
+	if hasCorrect && !hasWrong {
+		r.ok = true
+		r.state = "already registered for this project"
+		return r
+	}
+
+	// Absent, or drifted (a stale path): strip any salvager entry and add a fresh
+	// one. Reuses the same remove+re-add reasoning as reconcileMCP for a moved binary.
+	newPre := append(stripSalvagerHooks(pre, env.exePath), desiredHookBlock(env.exePath))
+	setPreToolUseBlocks(settings, newPre)
+	if err := writeSettings(path, settings); err != nil {
+		r.ok = false
+		r.state = "could not write"
+		r.detail = err.Error()
+		return r
+	}
+	r.ok = true
+	r.state = "registered"
+	return r
+}
+
+func undoHook(env *initEnv) pieceResult {
+	r := pieceResult{label: "PreToolUse"}
+	path := settingsLocalPath(env.root)
+
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		r.ok = true
+		r.state = "no settings file (nothing to remove)"
+		return r
+	}
+	if err != nil {
+		r.ok = false
+		r.state = "could not read"
+		r.detail = err.Error()
+		return r
+	}
+	settings := map[string]any{}
+	if len(bytes.TrimSpace(data)) > 0 {
+		if json.Unmarshal(data, &settings) != nil {
+			r.ok = false
+			r.state = "skipped — settings.local.json is not valid JSON"
+			r.detail = "left untouched; remove the salvager hook entry yourself"
+			return r
+		}
+	}
+
+	pre := preToolUseBlocks(settings)
+	hasCorrect, hasWrong := salvagerHookState(pre, env.exePath)
+	if !hasCorrect && !hasWrong {
+		r.ok = true
+		r.state = "not registered (nothing to remove)"
+		return r
+	}
+	setPreToolUseBlocks(settings, stripSalvagerHooks(pre, env.exePath))
+	if err := writeSettings(path, settings); err != nil {
+		r.ok = false
+		r.state = "could not write"
+		r.detail = err.Error()
+		return r
+	}
+	r.ok = true
+	r.state = "removed"
+	return r
+}
+
+// readSettings reads and parses settings.local.json. ok=false (with err=nil)
+// means the file exists but is not valid JSON — the caller degrades safe. A
+// missing file yields an empty settings map, ok=true.
+func readSettings(path string) (map[string]any, bool, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return map[string]any{}, true, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	settings := map[string]any{}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return settings, true, nil
+	}
+	if json.Unmarshal(data, &settings) != nil {
+		return nil, false, nil
+	}
+	return settings, true, nil
+}
+
+// writeSettings atomically writes settings as indented JSON, creating .claude/ if
+// needed. atomicWrite preserves an existing file's perms (0644 for a new one).
+func writeSettings(path string, settings map[string]any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWrite(path, append(b, '\n'))
+}
+
+// preToolUseBlocks returns settings.hooks.PreToolUse as a slice, or nil when
+// absent or the wrong shape (the caller rebuilds it, preserving sibling keys).
+func preToolUseBlocks(settings map[string]any) []any {
+	hooks, _ := settings["hooks"].(map[string]any)
+	arr, _ := hooks["PreToolUse"].([]any)
+	return arr
+}
+
+// setPreToolUseBlocks writes the PreToolUse array back, mutating the EXISTING
+// hooks map so sibling event keys (PostToolUse, …) are preserved. An empty result
+// removes the key (and the hooks object if it becomes empty), so an undo leaves no
+// empty scaffolding behind.
+func setPreToolUseBlocks(settings map[string]any, blocks []any) {
+	hooks, _ := settings["hooks"].(map[string]any)
+	if hooks == nil {
+		hooks = map[string]any{}
+		settings["hooks"] = hooks
+	}
+	if len(blocks) == 0 {
+		delete(hooks, "PreToolUse")
+		if len(hooks) == 0 {
+			delete(settings, "hooks")
+		}
+		return
+	}
+	hooks["PreToolUse"] = blocks
+}
+
+// isSalvagerHookCmd identifies Salvager's own hook command, so undo and drift
+// repair touch exactly it. It matches the exact current command and, so a moved
+// binary (e.g. a Homebrew upgrade) is still recognised as ours, any `<...>/salvager hook`.
+func isSalvagerHookCmd(cmd, exePath string) bool {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == hookCommand(exePath) {
+		return true
+	}
+	fields := strings.Fields(cmd)
+	return len(fields) == 2 && fields[1] == "hook" && filepath.Base(fields[0]) == "salvager"
+}
+
+// salvagerHookState scans the PreToolUse blocks for Salvager's hook: hasCorrect is
+// true when an entry matches the current command exactly, hasWrong when a stale
+// (moved-binary) salvager entry is present. Idempotent registration needs both.
+func salvagerHookState(pre []any, exePath string) (hasCorrect, hasWrong bool) {
+	desired := hookCommand(exePath)
+	for _, b := range pre {
+		block, _ := b.(map[string]any)
+		hooksArr, _ := block["hooks"].([]any)
+		for _, h := range hooksArr {
+			hm, _ := h.(map[string]any)
+			cmd, _ := hm["command"].(string)
+			if !isSalvagerHookCmd(cmd, exePath) {
+				continue
+			}
+			if strings.TrimSpace(cmd) == desired {
+				hasCorrect = true
+			} else {
+				hasWrong = true
+			}
+		}
+	}
+	return hasCorrect, hasWrong
+}
+
+// stripSalvagerHooks returns pre with every Salvager hook entry removed. A matcher
+// block emptied of all hooks is dropped; every other block and any non-Salvager
+// hook inside a shared block is preserved untouched.
+func stripSalvagerHooks(pre []any, exePath string) []any {
+	var out []any
+	for _, b := range pre {
+		block, ok := b.(map[string]any)
+		if !ok {
+			out = append(out, b)
+			continue
+		}
+		hooksArr, ok := block["hooks"].([]any)
+		if !ok {
+			out = append(out, b)
+			continue
+		}
+		var kept []any
+		for _, h := range hooksArr {
+			hm, ok := h.(map[string]any)
+			if !ok {
+				kept = append(kept, h)
+				continue
+			}
+			cmd, _ := hm["command"].(string)
+			if isSalvagerHookCmd(cmd, exePath) {
+				continue // drop ours
+			}
+			kept = append(kept, h)
+		}
+		if len(kept) == 0 {
+			continue // block held only our hook → drop the empty block
+		}
+		block["hooks"] = kept
+		out = append(out, block)
+	}
+	return out
 }
 
 // --- report ----------------------------------------------------------------

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -544,5 +545,163 @@ func TestWriteFileAtomic_ContentModeAndNoTempLeftover(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".salvager-tmp-") {
 			t.Errorf("atomic write left a temp file behind: %s", e.Name())
 		}
+	}
+}
+
+// --- PreToolUse hook piece (#P1) -------------------------------------------
+
+func readSettingsFile(t *testing.T, env *initEnv) (string, bool) {
+	t.Helper()
+	data, err := os.ReadFile(settingsLocalPath(env.root))
+	if os.IsNotExist(err) {
+		return "", false
+	}
+	if err != nil {
+		t.Fatalf("read settings.local.json: %v", err)
+	}
+	return string(data), true
+}
+
+func writeSettingsFile(t *testing.T, env *initEnv, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(settingsLocalPath(env.root)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsLocalPath(env.root), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// hookAdded when the settings file is absent: a fresh Bash matcher pointing at
+// this binary is written.
+func TestHook_AddedWhenAbsent(t *testing.T) {
+	env := newTestEnv(t, &fakeClaude{}, true)
+
+	r := reconcileHook(env)
+	if !r.ok || r.state != "registered" {
+		t.Fatalf("expected registered, got ok=%v state=%q", r.ok, r.state)
+	}
+	content, ok := readSettingsFile(t, env)
+	if !ok {
+		t.Fatal("settings.local.json was not created")
+	}
+	if !strings.Contains(content, env.exePath+" hook") || !strings.Contains(content, `"Bash"`) {
+		t.Errorf("settings missing the salvager Bash hook:\n%s", content)
+	}
+}
+
+// Running reconcileHook twice changes nothing: second run reports already
+// registered and the file bytes are byte-for-byte identical.
+func TestHook_Idempotent(t *testing.T) {
+	env := newTestEnv(t, &fakeClaude{}, true)
+
+	reconcileHook(env)
+	first, _ := readSettingsFile(t, env)
+
+	r := reconcileHook(env)
+	if !r.ok || r.state != "already registered for this project" {
+		t.Fatalf("second run not idempotent: ok=%v state=%q", r.ok, r.state)
+	}
+	second, _ := readSettingsFile(t, env)
+	if first != second {
+		t.Errorf("second run rewrote the file:\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+}
+
+// Undo removes ONLY Salvager's entry, leaving a co-existing unrelated hook (and
+// other keys) intact.
+func TestHook_UndoRemovesOnlyOurs(t *testing.T) {
+	env := newTestEnv(t, &fakeClaude{}, true)
+
+	// Seed an unrelated PreToolUse hook plus an unrelated top-level key.
+	writeSettingsFile(t, env, `{
+  "model": "opus",
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Write", "hooks": [{"type": "command", "command": "other-tool guard", "timeout": 10}]}
+    ]
+  }
+}`)
+	if r := reconcileHook(env); !r.ok || r.state != "registered" {
+		t.Fatalf("add failed: %+v", r)
+	}
+	withBoth, _ := readSettingsFile(t, env)
+	if !strings.Contains(withBoth, "other-tool guard") || !strings.Contains(withBoth, env.exePath+" hook") {
+		t.Fatalf("expected both hooks present after add:\n%s", withBoth)
+	}
+
+	r := undoHook(env)
+	if !r.ok || r.state != "removed" {
+		t.Fatalf("undo failed: %+v", r)
+	}
+	after, _ := readSettingsFile(t, env)
+	if strings.Contains(after, env.exePath+" hook") {
+		t.Errorf("undo left Salvager's hook behind:\n%s", after)
+	}
+	if !strings.Contains(after, "other-tool guard") {
+		t.Errorf("undo removed the unrelated hook:\n%s", after)
+	}
+	if !strings.Contains(after, `"model": "opus"`) && !strings.Contains(after, `"model":"opus"`) {
+		t.Errorf("undo dropped an unrelated top-level key:\n%s", after)
+	}
+}
+
+// A malformed settings file degrades safe: reported as a failure, left untouched.
+func TestHook_MalformedDegradesSafe(t *testing.T) {
+	env := newTestEnv(t, &fakeClaude{}, true)
+	const bad = "{ this is not valid json"
+	writeSettingsFile(t, env, bad)
+
+	r := reconcileHook(env)
+	if r.ok || !strings.Contains(r.state, "not valid JSON") {
+		t.Fatalf("expected a safe-degrade failure, got %+v", r)
+	}
+	got, _ := readSettingsFile(t, env)
+	if got != bad {
+		t.Errorf("malformed file must be left untouched:\ngot:  %q\nwant: %q", got, bad)
+	}
+}
+
+// The atomic merge preserves every other key in the settings file.
+func TestHook_PreservesOtherKeys(t *testing.T) {
+	env := newTestEnv(t, &fakeClaude{}, true)
+	writeSettingsFile(t, env, `{"model": "opus", "permissions": {"allow": ["Bash(ls:*)"]}}`)
+
+	if r := reconcileHook(env); !r.ok {
+		t.Fatalf("reconcile failed: %+v", r)
+	}
+	var parsed map[string]any
+	content, _ := readSettingsFile(t, env)
+	if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+		t.Fatalf("result is not valid JSON: %v\n%s", err, content)
+	}
+	if parsed["model"] != "opus" {
+		t.Errorf("lost the model key:\n%s", content)
+	}
+	if _, ok := parsed["permissions"]; !ok {
+		t.Errorf("lost the permissions key:\n%s", content)
+	}
+	if parsed["hooks"] == nil {
+		t.Errorf("hook was not added:\n%s", content)
+	}
+}
+
+// Drift repair: a stale salvager hook (a moved binary) is replaced, not duplicated.
+func TestHook_RepairsDrift(t *testing.T) {
+	env := newTestEnv(t, &fakeClaude{}, true)
+	writeSettingsFile(t, env, `{
+  "hooks": {"PreToolUse": [
+    {"matcher": "Bash", "hooks": [{"type": "command", "command": "/old/path/salvager hook", "timeout": 5}]}
+  ]}
+}`)
+	if r := reconcileHook(env); !r.ok || r.state != "registered" {
+		t.Fatalf("drift repair failed: %+v", r)
+	}
+	content, _ := readSettingsFile(t, env)
+	if strings.Contains(content, "/old/path/salvager hook") {
+		t.Errorf("stale hook not removed:\n%s", content)
+	}
+	if strings.Count(content, "salvager hook") != 1 {
+		t.Errorf("expected exactly one salvager hook after repair:\n%s", content)
 	}
 }
