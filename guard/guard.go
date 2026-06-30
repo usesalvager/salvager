@@ -196,8 +196,11 @@ func matchParen(s string, start int) (inner string, end int) {
 }
 
 // splitTop splits on unquoted separators ; && || | and newline. A `|` immediately
-// after a `>` is the `>|` clobber-override redirect operator, not a pipe — it stays
-// in the clause so redirectTargets can judge its file target.
+// after an UNESCAPED `>` is the `>|` clobber-override redirect operator, not a pipe —
+// it stays in the clause so redirectTargets can judge its file target. An escaped `\>`
+// is a literal word-char, so the following `|` is a real pipe and MUST split: e.g.
+// `echo \>|rm -rf ~` is `echo '>' | rm -rf ~` in the shell — the rm must be classified,
+// not swallowed. (Erring toward more clauses is the safe direction.)
 func splitTop(s string) []string {
 	var out []string
 	var b strings.Builder
@@ -229,8 +232,8 @@ func splitTop(s string) []string {
 			}
 			flush()
 		case '|':
-			if i > 0 && s[i-1] == '>' {
-				b.WriteByte(c) // `>|` clobber-override redirect, not a pipe
+			if i > 0 && s[i-1] == '>' && !escapedAt(s, i-1) {
+				b.WriteByte(c) // unescaped `>|` clobber-override redirect, not a pipe
 				continue
 			}
 			if i+1 < len(s) && s[i+1] == '|' {
@@ -243,6 +246,17 @@ func splitTop(s string) []string {
 	}
 	flush()
 	return out
+}
+
+// escapedAt reports whether the byte at index j is backslash-escaped — preceded by an
+// ODD run of `\`. Lets splitTop tell a real `>` redirect operator from a literal `\>`
+// word-char, so `echo \>|rm …` is not mistaken for a `>|` redirect and the pipe splits.
+func escapedAt(s string, j int) bool {
+	n := 0
+	for k := j - 1; k >= 0 && s[k] == '\\'; k-- {
+		n++
+	}
+	return n%2 == 1
 }
 
 // tokenize splits one clause into words on unquoted whitespace, stripping the

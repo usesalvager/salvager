@@ -74,6 +74,14 @@ func TestHarden_Classify(t *testing.T) {
 		{"ls missing 2>&1", TierPass},      // fd dup, not a file write
 		{"build > log.txt 2>&1", TierPass}, // dup alongside a benign redirect
 
+		// --- security: escaped `\>` must NOT arm >| split-suppression ------------
+		// In the shell `\>` is a literal word-char, so a following `|` is a real pipe and
+		// the right-hand command MUST be classified, not swallowed by a fake `>|` redirect.
+		{`echo \>|rm -rf ~`, TierDeny},     // = `echo '>' | rm -rf ~`: rm escapes the tree
+		{`x\>|rm -rf .salvager`, TierDeny}, // escaped pipe; rm destroys the net
+		{`echo \>\>|rm -rf ~`, TierDeny},   // two escaped > = literal `>>` word, then a real pipe
+		{`echo \>| out.txt`, TierPass},     // escaped form is a pipe; rhs `out.txt` is benign
+
 		// --- wrapper / quoting / compound robustness -----------------------------
 		{"sudo cp x .env", TierDeny},
 		{"bash -c 'cp x .env'", TierDeny},
