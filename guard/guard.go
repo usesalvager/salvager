@@ -23,6 +23,14 @@
 // Never block something the net could have undone anyway; only wall off what it
 // cannot save. A missed dangerous command is still recoverable by the watcher; a
 // false deny erodes trust — so the classifier favours precision over coverage.
+//
+// Honest limit: this classifier parses SHELL file-ops, not arbitrary interpreter
+// code. An inline write through a language runtime — python -c "open('.env','w')…",
+// node -e "fs.writeFileSync('.env',…)", perl -e … — is opaque to a shell parser and
+// passes. Defence-in-depth still covers it: the watcher recovers anything the
+// interpreter writes to a non-gitignored file. The one thing genuinely unprotected at
+// this layer is a *gitignored secret* written by an interpreter (recovery never saw
+// it, and the shell parser can't see the write). We do not pretend to close that gap.
 package guard
 
 import (
@@ -187,7 +195,12 @@ func matchParen(s string, start int) (inner string, end int) {
 	return s[start:], len(s) - 1
 }
 
-// splitTop splits on unquoted separators ; && || | and newline.
+// splitTop splits on unquoted separators ; && || | and newline. A `|` immediately
+// after an UNESCAPED `>` is the `>|` clobber-override redirect operator, not a pipe —
+// it stays in the clause so redirectTargets can judge its file target. An escaped `\>`
+// is a literal word-char, so the following `|` is a real pipe and MUST split: e.g.
+// `echo \>|rm -rf ~` is `echo '>' | rm -rf ~` in the shell — the rm must be classified,
+// not swallowed. (Erring toward more clauses is the safe direction.)
 func splitTop(s string) []string {
 	var out []string
 	var b strings.Builder
@@ -219,6 +232,10 @@ func splitTop(s string) []string {
 			}
 			flush()
 		case '|':
+			if i > 0 && s[i-1] == '>' && !escapedAt(s, i-1) {
+				b.WriteByte(c) // unescaped `>|` clobber-override redirect, not a pipe
+				continue
+			}
 			if i+1 < len(s) && s[i+1] == '|' {
 				i++
 			}
@@ -229,6 +246,17 @@ func splitTop(s string) []string {
 	}
 	flush()
 	return out
+}
+
+// escapedAt reports whether the byte at index j is backslash-escaped — preceded by an
+// ODD run of `\`. Lets splitTop tell a real `>` redirect operator from a literal `\>`
+// word-char, so `echo \>|rm …` is not mistaken for a `>|` redirect and the pipe splits.
+func escapedAt(s string, j int) bool {
+	n := 0
+	for k := j - 1; k >= 0 && s[k] == '\\'; k-- {
+		n++
+	}
+	return n%2 == 1
 }
 
 // tokenize splits one clause into words on unquoted whitespace, stripping the
@@ -317,6 +345,14 @@ func classifyClause(clause, root string) Decision {
 		return classifySed(args, root)
 	case "mv":
 		return classifyMv(args, root)
+	case "tee":
+		return classifyTee(args, root)
+	case "cp":
+		return classifyCp("cp", args, root)
+	case "install":
+		return classifyCp("install", args, root)
+	case "ln":
+		return classifyLn(args, root)
 	case "find":
 		return classifyFind(args, root)
 	case "truncate":
@@ -576,35 +612,68 @@ func classifySed(args []string, root string) Decision {
 	return checkpoint("sed-i")
 }
 
-// classifyFind flags `find ... -delete`. Its search roots are the path tokens
-// before the first predicate (the first `-`-prefixed token); a root outside the
-// tree (find / -delete, find ~ -delete) is unrecoverable.
+// classifyFind flags a destructive find: `-delete`, or an `-exec`/`-execdir` whose
+// command is a destructive verb (rm, mv, truncate, …) — `find . -name .env -exec rm
+// {} \;` deletes just as `-delete` does. Search roots are the path tokens before the
+// first predicate; a root outside the tree (find / …, find ~ …) is unrecoverable, and
+// a protected path named anywhere in the expression (a root, or a -name/-path operand
+// naming a protected file to delete) is a protected deny. Inside the tree → checkpoint.
 func classifyFind(args []string, root string) Decision {
-	hasDelete := false
-	for _, a := range args {
-		if a == "-delete" {
-			hasDelete = true
-			break
-		}
-	}
-	if !hasDelete {
+	if !findDestructive(args) {
 		return pass()
 	}
+	// Search roots only (judged for tree-escape): a -path/-name value that happens to
+	// look absolute is an operand, not a walk root, so net/outside is checked here.
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") {
 			break // predicates start here; search roots are done
 		}
+		switch pathClass(a, root) {
+		case pathNet:
+			return denyNet("find", a)
+		case pathOutside:
+			return denyOutside("find", a)
+		}
+	}
+	// A protected path named anywhere in a destructive find is a protected deny.
+	// TODO(review#3): a find rooted UNDER a protected dir with no matching -name (e.g.
+	// in-tree `find .ssh -type f -delete`) isn't denied — rare, out of current scope.
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") || a == "{}" || a == ";" || a == `\;` || a == "+" {
+			continue // a flag/predicate or find's -exec syntax, not a target path
+		}
 		if d, ok := protectedDeny(a, root); ok {
 			return d
 		}
-		switch pathClass(a, root) {
-		case pathNet:
-			return denyNet("find -delete", a)
-		case pathOutside:
-			return denyOutside("find -delete", a)
+	}
+	return checkpoint("find-destructive")
+}
+
+// findDestructive reports whether a find expression deletes: a -delete predicate, or
+// an -exec/-execdir running a destructive verb. Conservative — an -exec sh -c "…" is
+// NOT expanded (the inner is opaque shell, the documented interpreter limit), only a
+// directly-named destructive verb counts.
+func findDestructive(args []string) bool {
+	for i, a := range args {
+		if a == "-delete" {
+			return true
+		}
+		if (a == "-exec" || a == "-execdir") && i+1 < len(args) &&
+			isDestructiveVerb(filepath.Base(args[i+1])) {
+			return true
 		}
 	}
-	return checkpoint("find-delete")
+	return false
+}
+
+// isDestructiveVerb reports whether a command name (an -exec target, say) destroys
+// files. Kept to verbs that always write/delete, so a benign -exec stays a pass.
+func isDestructiveVerb(base string) bool {
+	switch base {
+	case "rm", "mv", "truncate", "shred", "dd":
+		return true
+	}
+	return false
 }
 
 // classifyTruncate flags `truncate` (it shortens/zeroes a file). Inside the tree
@@ -644,20 +713,108 @@ func classifyTruncate(args []string, root string) Decision {
 	return checkpoint("truncate")
 }
 
-// classifyMv flags an mv whose source or destination is a protected path: moving a
-// protected file away destroys it at its location, and moving onto one overwrites
-// it. This handler is C2-scoped — it adds only the protected check; mv was not
-// otherwise classified by P1, so a non-protected mv passes (the watcher recovers it).
-func classifyMv(args []string, root string) Decision {
-	for _, a := range args {
-		if strings.HasPrefix(a, "-") {
-			continue // a flag (-f, -v, …), not a path
-		}
-		if d, ok := protectedDeny(a, root); ok {
+// denyIfUnsafeWrite returns a Tier A deny if writing to target is unrecoverable: it
+// escapes the watched tree (outside, or the .salvager net) or hits a protected path.
+// This is the cp/tee/mv/install/ln write-destination equivalent of the guard already
+// applied to rm, sed -i and > redirects — closing the tree-escape parity gap.
+//
+// Deliberately NO pathRoot/denyWholeTree case: for a WRITE, the root (".") is just the
+// cwd you write into (cp x ., mv x .) — recoverable and ubiquitous — not whole-tree
+// destruction, which is a delete-only concept. This mirrors the > redirect / sed -i /
+// truncate guards exactly (they too deny only net/outside); only rm, a delete, treats
+// the root as fatal. Including pathRoot here would false-deny `cp x .`.
+func denyIfUnsafeWrite(verb, target, root string) (Decision, bool) {
+	switch pathClass(target, root) {
+	case pathNet:
+		return denyNet(verb, target), true
+	case pathOutside:
+		return denyOutside(verb, target), true
+	}
+	return protectedDeny(target, root) // protected hit (or no deny)
+}
+
+// The cp/tee/mv/install/ln classifiers share one rule: escape-check the unambiguous
+// WRITE destination(s); protected-check destinations (and, for mv, sources too, since
+// a moved-away source is destroyed); never escape-check a READ argument.
+
+// classifyCp handles cp and install: `[flags] src… dest`. The dest is the last non-flag
+// arg and the only write — escape+protected-check it. The src args are reads, untouched.
+func classifyCp(verb string, args []string, root string) Decision {
+	nf := nonFlagArgs(args)
+	if len(nf) == 0 {
+		return pass()
+	}
+	if d, ok := denyIfUnsafeWrite(verb, nf[len(nf)-1], root); ok {
+		return d
+	}
+	return pass()
+}
+
+// classifyTee handles tee: `[flags] file…`. Every non-flag operand is a write target.
+func classifyTee(args []string, root string) Decision {
+	for _, a := range nonFlagArgs(args) {
+		if d, ok := denyIfUnsafeWrite("tee", a, root); ok {
 			return d
 		}
 	}
 	return pass()
+}
+
+// classifyMv handles mv: `[flags] src… dest`. The dest (last non-flag) is the write —
+// escape+protected-check it. The sources are reads for the escape check (mv /etc/hosts
+// ./x reads outside, writes in-tree → must pass), but a protected source is still a deny
+// because the move destroys it at its old location.
+func classifyMv(args []string, root string) Decision {
+	nf := nonFlagArgs(args)
+	if len(nf) == 0 {
+		return pass()
+	}
+	dest := nf[len(nf)-1]
+	for _, src := range nf[:len(nf)-1] {
+		if d, ok := protectedDeny(src, root); ok {
+			return d
+		}
+	}
+	if d, ok := denyIfUnsafeWrite("mv", dest, root); ok {
+		return d
+	}
+	return pass()
+}
+
+// classifyLn handles ln. With two+ non-flag args (`[flags] target linkname`) the linkname
+// is the write — escape+protected-check it; target is a read. With a single non-flag arg
+// (`ln target`) the real write is basename(target) created in cwd (in-tree, so no escape
+// check) — only protected-check that basename, so `ln /backup/.env` (which would create
+// .env here) is still caught.
+func classifyLn(args []string, root string) Decision {
+	nf := nonFlagArgs(args)
+	switch len(nf) {
+	case 0:
+		return pass()
+	case 1:
+		if d, ok := protectedDeny(filepath.Base(nf[0]), root); ok {
+			return d
+		}
+		return pass()
+	default:
+		if d, ok := denyIfUnsafeWrite("ln", nf[len(nf)-1], root); ok {
+			return d
+		}
+		return pass()
+	}
+}
+
+// nonFlagArgs returns the arguments that are not "-"-prefixed flags, in order. A bundled
+// value flag (cp -t DIR) could shift which non-flag is the true dest, but that's an
+// obscure form; taking operands positionally is the conservative reading.
+func nonFlagArgs(args []string) []string {
+	var out []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // fileTargets returns ts[skip:] (its leading non-file tokens dropped). root is
@@ -737,9 +894,10 @@ func pathClass(token, root string) int {
 	return pathOutside // ancestor of root, or fully outside
 }
 
-// redirectTargets returns the file targets of any >/>> redirections in a clause,
-// so a redirect that writes into the net or outside the tree can be denied. fd
-// duplications (2>&1) are not file writes and are skipped.
+// redirectTargets returns the file targets of any >/>>/>| redirections in a clause,
+// so a redirect that writes into the net or outside the tree can be denied. It covers
+// the clobber forms (>, >>, >| with -o noclobber overridden); fd duplications
+// (2>&1, >&2) are not file writes and are skipped.
 func redirectTargets(toks []string) []string {
 	var out []string
 	for i := 0; i < len(toks); i++ {
@@ -757,6 +915,7 @@ func redirectTargets(toks []string) []string {
 		default:
 			continue
 		}
+		rest = strings.TrimPrefix(rest, "|") // >| clobber-override: the file follows the bar
 		if strings.HasPrefix(rest, "&") {
 			continue // fd dup, not a file
 		}
