@@ -347,9 +347,12 @@ protected path** — `Write`/`Edit`, and `rm` / `sed -i` / `mv` / `truncate` /
 It works like antivirus definitions: a **built-in default set** plus a **user
 layer**, layered.
 
-- **Defaults** (shipped, focused on what recovery can't save): `.env`, `.env.*`,
-  `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`, `id_*`, `credentials`, `.npmrc`,
-  `.pypirc`, `.aws/**`, `.ssh/**`, `.git/**`. (`.salvager/` is already net-protected.)
+- **Defaults** (shipped, focused on what recovery can't save): `.env`, `.env.*`
+  (but **not** the non-secret templates `.env.example` / `.sample` / `.template` /
+  `.dist`), `*.pem`, `*.key`, `*.p12`, `*.pfx`, the SSH private keys `id_rsa` /
+  `id_dsa` / `id_ecdsa` / `id_ed25519` (their `.pub` public halves are **not**
+  protected), `credentials`, `.npmrc`, `.pypirc`, `.aws/**`, `.ssh/**`, `.git/**`.
+  (`.salvager/` is already net-protected.)
 - **User layer** — `.salvager/protected`, plain text, one glob per line, `#`
   comments. A pattern with no `/` matches a **basename** at any depth (`*.crt`); a
   trailing `/**` matches anything under a directory (`secrets/**`); any other

@@ -25,16 +25,20 @@ import (
 // at the unrecoverable/sacred (secrets, credentials, git internals). Patterns with
 // no "/" match a file's BASENAME at any depth; a trailing "/**" matches anything
 // beneath a directory of that name at any depth; any other "/" pattern matches the
-// full root-relative path. .salvager/** is deliberately ABSENT — it is already
-// net-protected by P1 (pathNet); duplicating it here would be redundant.
+// full root-relative path. A leading "!" is a built-in negation (same last-match-wins
+// resolution as the user layer), used to carve known-safe look-alikes back out of a
+// broad pattern — e.g. .env.* protects real dotenv secrets but the !.env.example
+// lines free the non-secret templates. .salvager/** is deliberately ABSENT — it is
+// already net-protected by P1 (pathNet); duplicating it here would be redundant.
 //
 // NOTE: fleet-tuned protected definitions are a future paid-feed layer. This slice
 // is the seam where a richer, remotely-updated set would plug in — but nothing
 // remote is loaded today; the user layer (.salvager/protected) is the only addition.
 var defaultProtected = []string{
-	".env", ".env.*", // dotenv secrets (gitignored — recovery can't save them)
-	"*.pem", "*.key", "*.p12", "*.pfx", // private keys / cert bundles
-	"id_rsa", "id_*", // ssh private keys
+	".env", ".env.*", // dotenv secrets (gitignored — recovery can't save them) …
+	"!.env.example", "!.env.sample", "!.env.template", "!.env.dist", // … except known-safe, non-secret templates agents routinely create (negations follow .env.* so last-match-wins frees them)
+	"*.pem", "*.key", "*.p12", "*.pfx", // private keys / cert bundles. *.key is borderline (some i18n bundles use .key); left in — a non-secret .key is still recoverable by the watcher, and a user `!`-exclusion frees it if it misfires.
+	"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", // ssh private keys by exact name (NOT id_* — that falsely hit id_helper.go etc.; NOT *.pub — public keys aren't secret)
 	"credentials",       // aws/gcloud-style credential files
 	".npmrc", ".pypirc", // package-registry tokens
 	".aws/**", ".ssh/**", // credential directories
