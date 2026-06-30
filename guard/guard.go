@@ -329,12 +329,16 @@ func classifyClause(clause, root string) Decision {
 		return classifyGit(args)
 	case "sed":
 		return classifySed(args, root)
-	case "mv", "tee":
-		// C2-scoped: every non-flag path arg is a write/delete target.
-		return denyAnyProtectedArg(args, root)
-	case "cp", "install", "ln":
-		// C2-scoped: the destination (last non-flag arg) is the write target.
-		return denyProtectedDest(args, root)
+	case "mv":
+		return classifyMv(args, root)
+	case "tee":
+		return classifyTee(args, root)
+	case "cp":
+		return classifyCp("cp", args, root)
+	case "install":
+		return classifyCp("install", args, root)
+	case "ln":
+		return classifyLn(args, root)
 	case "find":
 		return classifyFind(args, root)
 	case "truncate":
@@ -618,6 +622,8 @@ func classifyFind(args []string, root string) Decision {
 		}
 	}
 	// A protected path named anywhere in a destructive find is a protected deny.
+	// TODO(review#3): a find rooted UNDER a protected dir with no matching -name (e.g.
+	// in-tree `find .ssh -type f -delete`) isn't denied — rare, out of current scope.
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") || a == "{}" || a == ";" || a == `\;` || a == "+" {
 			continue // a flag/predicate or find's -exec syntax, not a target path
@@ -693,47 +699,108 @@ func classifyTruncate(args []string, root string) Decision {
 	return checkpoint("truncate")
 }
 
-// denyAnyProtectedArg is the C2-scoped check for commands whose EVERY non-flag path
-// argument is a write/delete target: mv (moving a protected file away destroys it at
-// its location, moving onto one overwrites it) and tee (writes every file operand). A
-// protected hit is a Tier A deny; anything else passes — these were not otherwise
-// classified by P1, so a non-protected use stays silent (the watcher recovers it).
-func denyAnyProtectedArg(args []string, root string) Decision {
+// denyIfUnsafeWrite returns a Tier A deny if writing to target is unrecoverable: it
+// escapes the watched tree (outside, or the .salvager net) or hits a protected path.
+// This is the cp/tee/mv/install/ln write-destination equivalent of the guard already
+// applied to rm, sed -i and > redirects — closing the tree-escape parity gap.
+//
+// Deliberately NO pathRoot/denyWholeTree case: for a WRITE, the root (".") is just the
+// cwd you write into (cp x ., mv x .) — recoverable and ubiquitous — not whole-tree
+// destruction, which is a delete-only concept. This mirrors the > redirect / sed -i /
+// truncate guards exactly (they too deny only net/outside); only rm, a delete, treats
+// the root as fatal. Including pathRoot here would false-deny `cp x .`.
+func denyIfUnsafeWrite(verb, target, root string) (Decision, bool) {
+	switch pathClass(target, root) {
+	case pathNet:
+		return denyNet(verb, target), true
+	case pathOutside:
+		return denyOutside(verb, target), true
+	}
+	return protectedDeny(target, root) // protected hit (or no deny)
+}
+
+// The cp/tee/mv/install/ln classifiers share one rule: escape-check the unambiguous
+// WRITE destination(s); protected-check destinations (and, for mv, sources too, since
+// a moved-away source is destroyed); never escape-check a READ argument.
+
+// classifyCp handles cp and install: `[flags] src… dest`. The dest is the last non-flag
+// arg and the only write — escape+protected-check it. The src args are reads, untouched.
+func classifyCp(verb string, args []string, root string) Decision {
+	nf := nonFlagArgs(args)
+	if len(nf) == 0 {
+		return pass()
+	}
+	if d, ok := denyIfUnsafeWrite(verb, nf[len(nf)-1], root); ok {
+		return d
+	}
+	return pass()
+}
+
+// classifyTee handles tee: `[flags] file…`. Every non-flag operand is a write target.
+func classifyTee(args []string, root string) Decision {
+	for _, a := range nonFlagArgs(args) {
+		if d, ok := denyIfUnsafeWrite("tee", a, root); ok {
+			return d
+		}
+	}
+	return pass()
+}
+
+// classifyMv handles mv: `[flags] src… dest`. The dest (last non-flag) is the write —
+// escape+protected-check it. The sources are reads for the escape check (mv /etc/hosts
+// ./x reads outside, writes in-tree → must pass), but a protected source is still a deny
+// because the move destroys it at its old location.
+func classifyMv(args []string, root string) Decision {
+	nf := nonFlagArgs(args)
+	if len(nf) == 0 {
+		return pass()
+	}
+	dest := nf[len(nf)-1]
+	for _, src := range nf[:len(nf)-1] {
+		if d, ok := protectedDeny(src, root); ok {
+			return d
+		}
+	}
+	if d, ok := denyIfUnsafeWrite("mv", dest, root); ok {
+		return d
+	}
+	return pass()
+}
+
+// classifyLn handles ln. With two+ non-flag args (`[flags] target linkname`) the linkname
+// is the write — escape+protected-check it; target is a read. With a single non-flag arg
+// (`ln target`) the real write is basename(target) created in cwd (in-tree, so no escape
+// check) — only protected-check that basename, so `ln /backup/.env` (which would create
+// .env here) is still caught.
+func classifyLn(args []string, root string) Decision {
+	nf := nonFlagArgs(args)
+	switch len(nf) {
+	case 0:
+		return pass()
+	case 1:
+		if d, ok := protectedDeny(filepath.Base(nf[0]), root); ok {
+			return d
+		}
+		return pass()
+	default:
+		if d, ok := denyIfUnsafeWrite("ln", nf[len(nf)-1], root); ok {
+			return d
+		}
+		return pass()
+	}
+}
+
+// nonFlagArgs returns the arguments that are not "-"-prefixed flags, in order. A bundled
+// value flag (cp -t DIR) could shift which non-flag is the true dest, but that's an
+// obscure form; taking operands positionally is the conservative reading.
+func nonFlagArgs(args []string) []string {
+	var out []string
 	for _, a := range args {
-		if strings.HasPrefix(a, "-") {
-			continue // a flag (-f, -v, …), not a path
-		}
-		if d, ok := protectedDeny(a, root); ok {
-			return d
+		if !strings.HasPrefix(a, "-") {
+			out = append(out, a)
 		}
 	}
-	return pass()
-}
-
-// denyProtectedDest is the C2-scoped check for commands whose write target is the
-// LAST non-flag argument: cp / install (… src dest) and ln (target linkname, which
-// -f clobbers). A protected destination is a Tier A deny; anything else passes. A
-// protected SOURCE is only read, and reads aren't guarded — so only the dest matters.
-func denyProtectedDest(args []string, root string) Decision {
-	if dst, ok := lastNonFlag(args); ok {
-		if d, ok := protectedDeny(dst, root); ok {
-			return d
-		}
-	}
-	return pass()
-}
-
-// lastNonFlag returns the last argument that is not a "-"-prefixed flag — the
-// destination operand for cp/install/ln-style commands. A bundled value flag
-// (cp -t DIR) could shift the true dest, but that's an obscure form; taking the last
-// operand is the conservative reading and never over-denies a non-protected dest.
-func lastNonFlag(args []string) (string, bool) {
-	for i := len(args) - 1; i >= 0; i-- {
-		if !strings.HasPrefix(args[i], "-") {
-			return args[i], true
-		}
-	}
-	return "", false
+	return out
 }
 
 // fileTargets returns ts[skip:] (its leading non-file tokens dropped). root is

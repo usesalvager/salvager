@@ -31,11 +31,29 @@ func TestHarden_Classify(t *testing.T) {
 		{"install -m 600 x .env", TierDeny}, // value flag as a separate token
 		{"ln -f x .env", TierDeny},
 		{"ln -sf /etc/passwd .ssh/authorized_keys", TierDeny}, // .ssh/** linkname
-		// … and their non-protected forms pass (no Tier-B noise) ------------------
+		{`ln /backup/.env`, TierDeny},                         // 1-arg ln: basename .env created in cwd
+
+		// --- FN (review#1): write target escaping the tree denies, parity with >/rm
+		{"tee /etc/hosts", TierDeny},
+		{"tee ~/.bashrc", TierDeny},
+		{"cp x /etc/hosts", TierDeny},
+		{"mv x /etc/hosts", TierDeny},
+		{"install x ~/.bashrc", TierDeny},
+		{"ln -f x /etc/hosts", TierDeny},
+		{"cp x .salvager/objects/y", TierDeny}, // … and onto the net
+		{"tee .salvager/x", TierDeny},
+		{"mv x .salvager/x", TierDeny},
+
+		// … and their non-protected, in-tree forms pass (no Tier-B noise, no new FP) ----
 		{"cp x app.go", TierPass},
 		{"cp build/a build/b", TierPass},
 		{"tee out.log", TierPass},
-		{"install -m755 bin/tool /usr/local/bin/tool", TierPass}, // dest outside isn't a protected hit; cp/install aren't tree-escape guarded
+		{"cp x .", TierPass}, // dest is the tree root dir = write INTO the tree, not destroy it
+		{"mv x .", TierPass},
+		{"mv /etc/hosts ./local", TierPass},      // reads outside, writes in-tree
+		{"ln -s /etc/hosts hostslink", TierPass}, // reads outside, link in-tree
+		{"ln -s /etc/hosts", TierPass},           // 1-arg: basename "hosts" not protected
+		{"install -m755 bin/tool ./bin/tool", TierPass},
 		{"ln -sf a.txt link.txt", TierPass},
 
 		// --- FN: find -exec rm deletes without -delete ---------------------------
