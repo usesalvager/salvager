@@ -60,11 +60,11 @@ func (t Tier) String() string {
 // Request is one normalized about-to-run tool call. Agent-agnostic on purpose:
 // an adapter fills it from whatever protocol its agent speaks.
 type Request struct {
-	Tool    string // the tool name, e.g. "Bash"
-	Command string // for Bash: the shell command line
-	Root    string // the project tree the agent is operating in (cwd)
-	Agent   string // who saw it, e.g. "claude-code" — recorded by the seismograph
-	// FilePath string // later: for Edit/Write path-based protection (C2)
+	Tool     string // the tool name, e.g. "Bash"
+	Command  string // for Bash: the shell command line
+	FilePath string // for Edit/Write: the path the tool would write — checked against protected paths
+	Root     string // the project tree the agent is operating in (cwd)
+	Agent    string // who saw it, e.g. "claude-code" — recorded by the seismograph
 }
 
 // Decision is the classification result. Reason is filled for a deny (it tells
@@ -86,12 +86,20 @@ var nowFunc = func() int64 { return time.Now().UnixMilli() }
 // drift would be caught by the seismograph test writing under it.
 const storeDir = ".salvager"
 
-// Classify is the pure, fast, I/O-free heart. It splits a compound command into
-// independently-judged clauses and returns the most severe verdict. Purity is
-// deliberate: it cannot fail, so the adapter can always fail-open, and it can run
-// in the agent's hot path in microseconds. The seismograph (LogAttempt) is the
-// only side effect, kept separate so a logging error never changes the verdict.
+// Classify is the fast, near-pure heart. It splits a compound command into
+// independently-judged clauses and returns the most severe verdict. Its only I/O is
+// one cheap, failure-tolerant read of .salvager/protected (via ProtectedHit) — it
+// still cannot fail, so the adapter can always fail-open, and it runs in the agent's
+// hot path in microseconds. The seismograph (LogAttempt) is the only other side
+// effect, kept separate so a logging error never changes the verdict.
 func Classify(req Request) Decision {
+	// Direct write/edit (Edit/Write tools): a protected target is a Tier A deny. A
+	// non-protected write is a pass — the watcher covers its recovery.
+	if req.FilePath != "" {
+		if d, ok := protectedDeny(req.FilePath, req.Root); ok {
+			return d
+		}
+	}
 	best := Decision{Tier: TierPass}
 	for _, clause := range splitClauses(req.Command) {
 		if d := classifyClause(clause, req.Root); d.Tier > best.Tier {
@@ -273,8 +281,11 @@ func classifyClause(clause, root string) Decision {
 	}
 
 	// A redirection to the net or outside the tree is destruction the watcher
-	// can't recover, whatever the command is.
+	// can't recover, whatever the command is — as is one onto a protected path.
 	for _, tgt := range redirectTargets(toks) {
+		if d, ok := protectedDeny(tgt, root); ok {
+			return d
+		}
 		switch pathClass(tgt, root) {
 		case pathNet:
 			return denyNet("redirect", tgt)
@@ -304,6 +315,8 @@ func classifyClause(clause, root string) Decision {
 		return classifyGit(args)
 	case "sed":
 		return classifySed(args, root)
+	case "mv":
+		return classifyMv(args, root)
 	case "find":
 		return classifyFind(args, root)
 	case "truncate":
@@ -398,6 +411,9 @@ func argsContain(args []string, want string) bool {
 func classifyRm(args []string, root string) Decision {
 	recursive, force, targets := parseRm(args)
 	for _, t := range targets {
+		if d, ok := protectedDeny(t, root); ok {
+			return d
+		}
 		switch pathClass(t, root) {
 		case pathNet:
 			return denyNet("rm", t)
@@ -547,6 +563,9 @@ func classifySed(args []string, root string) Decision {
 	}
 	// The first non-flag token is sed's script, not a file; judge the rest as files.
 	for _, t := range fileTargets(targets, 1, root) {
+		if d, ok := protectedDeny(t, root); ok {
+			return d
+		}
 		switch pathClass(t, root) {
 		case pathNet:
 			return denyNet("sed -i", t)
@@ -574,6 +593,9 @@ func classifyFind(args []string, root string) Decision {
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") {
 			break // predicates start here; search roots are done
+		}
+		if d, ok := protectedDeny(a, root); ok {
+			return d
 		}
 		switch pathClass(a, root) {
 		case pathNet:
@@ -606,6 +628,9 @@ func classifyTruncate(args []string, root string) Decision {
 		}
 	}
 	for _, t := range targets {
+		if d, ok := protectedDeny(t, root); ok {
+			return d
+		}
 		switch pathClass(t, root) {
 		case pathNet:
 			return denyNet("truncate", t)
@@ -617,6 +642,22 @@ func classifyTruncate(args []string, root string) Decision {
 		return pass()
 	}
 	return checkpoint("truncate")
+}
+
+// classifyMv flags an mv whose source or destination is a protected path: moving a
+// protected file away destroys it at its location, and moving onto one overwrites
+// it. This handler is C2-scoped — it adds only the protected check; mv was not
+// otherwise classified by P1, so a non-protected mv passes (the watcher recovers it).
+func classifyMv(args []string, root string) Decision {
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			continue // a flag (-f, -v, …), not a path
+		}
+		if d, ok := protectedDeny(a, root); ok {
+			return d
+		}
+	}
+	return pass()
 }
 
 // fileTargets returns ts[skip:] (its leading non-file tokens dropped). root is
