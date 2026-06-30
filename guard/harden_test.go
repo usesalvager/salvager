@@ -44,6 +44,21 @@ func TestHarden_Classify(t *testing.T) {
 		{"tee .salvager/x", TierDeny},
 		{"mv x .salvager/x", TierDeny},
 
+		// --- FN: -t/--target-directory shifts the write dest to the flag value -----
+		// The real dest is the -t DIR, not the last positional — escape-check it.
+		{"cp -t ~ payload", TierDeny},
+		{"cp -t /etc payload", TierDeny},
+		{"cp --target-directory=/etc payload", TierDeny},
+		{"cp --target-directory /etc payload", TierDeny},
+		{"cp -t~ payload", TierDeny},   // value bundled onto the flag
+		{"cp -it ~ payload", TierDeny}, // short bundle ending in -t
+		{"install -t ~ x", TierDeny},
+		{"mv -t ~ payload", TierDeny},
+		{"ln -t ~ target", TierDeny},
+		{"cp -t .salvager payload", TierDeny}, // onto the net
+		{"cp -t build payload", TierPass},     // -t into an in-tree dir is fine
+		{"mv -t ./sub /etc/hosts", TierPass},  // reads outside, writes in-tree
+
 		// … and their non-protected, in-tree forms pass (no Tier-B noise, no new FP) ----
 		{"cp x app.go", TierPass},
 		{"cp build/a build/b", TierPass},

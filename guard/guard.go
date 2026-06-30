@@ -737,14 +737,19 @@ func denyIfUnsafeWrite(verb, target, root string) (Decision, bool) {
 // WRITE destination(s); protected-check destinations (and, for mv, sources too, since
 // a moved-away source is destroyed); never escape-check a READ argument.
 
-// classifyCp handles cp and install: `[flags] src… dest`. The dest is the last non-flag
-// arg and the only write — escape+protected-check it. The src args are reads, untouched.
+// classifyCp handles cp and install: `[flags] src… dest`. The write is the dest — the
+// -t/--target-directory value if present (then every positional is a source), else the
+// last non-flag arg. Escape+protected-check the dest; the src args are reads, untouched.
 func classifyCp(verb string, args []string, root string) Decision {
-	nf := nonFlagArgs(args)
-	if len(nf) == 0 {
-		return pass()
+	dest, ok := targetDirFlag(args)
+	if !ok {
+		nf := nonFlagArgs(args)
+		if len(nf) == 0 {
+			return pass()
+		}
+		dest = nf[len(nf)-1]
 	}
-	if d, ok := denyIfUnsafeWrite(verb, nf[len(nf)-1], root); ok {
+	if d, ok := denyIfUnsafeWrite(verb, dest, root); ok {
 		return d
 	}
 	return pass()
@@ -760,23 +765,28 @@ func classifyTee(args []string, root string) Decision {
 	return pass()
 }
 
-// classifyMv handles mv: `[flags] src… dest`. The dest (last non-flag) is the write —
-// escape+protected-check it. The sources are reads for the escape check (mv /etc/hosts
-// ./x reads outside, writes in-tree → must pass), but a protected source is still a deny
-// because the move destroys it at its old location.
+// classifyMv handles mv: `[flags] src… dest`. The dest is the write — the
+// -t/--target-directory value if present (then every positional is a source), else the
+// last non-flag arg. Escape+protected-check the dest. The sources are reads for the
+// escape check (mv /etc/hosts ./x reads outside, writes in-tree → must pass), but a
+// protected source is still a deny because the move destroys it at its old location.
 func classifyMv(args []string, root string) Decision {
 	nf := nonFlagArgs(args)
-	if len(nf) == 0 {
-		return pass()
+	dest, srcs := "", nf
+	if dir, ok := targetDirFlag(args); ok {
+		dest = dir // -t DIR: every positional is a source
+	} else if len(nf) > 0 {
+		dest, srcs = nf[len(nf)-1], nf[:len(nf)-1]
 	}
-	dest := nf[len(nf)-1]
-	for _, src := range nf[:len(nf)-1] {
+	for _, src := range srcs {
 		if d, ok := protectedDeny(src, root); ok {
 			return d
 		}
 	}
-	if d, ok := denyIfUnsafeWrite("mv", dest, root); ok {
-		return d
+	if dest != "" {
+		if d, ok := denyIfUnsafeWrite("mv", dest, root); ok {
+			return d
+		}
 	}
 	return pass()
 }
@@ -787,6 +797,13 @@ func classifyMv(args []string, root string) Decision {
 // check) — only protected-check that basename, so `ln /backup/.env` (which would create
 // .env here) is still caught.
 func classifyLn(args []string, root string) Decision {
+	// `ln -t DIR target…` creates the links inside DIR — DIR is the write location.
+	if dir, ok := targetDirFlag(args); ok {
+		if d, ok := denyIfUnsafeWrite("ln", dir, root); ok {
+			return d
+		}
+		return pass()
+	}
 	nf := nonFlagArgs(args)
 	switch len(nf) {
 	case 0:
@@ -804,9 +821,36 @@ func classifyLn(args []string, root string) Decision {
 	}
 }
 
-// nonFlagArgs returns the arguments that are not "-"-prefixed flags, in order. A bundled
-// value flag (cp -t DIR) could shift which non-flag is the true dest, but that's an
-// obscure form; taking operands positionally is the conservative reading.
+// targetDirFlag extracts the value of a -t / --target-directory flag — the GNU
+// coreutils "copy/move/link INTO this directory" flag that cp/mv/install/ln accept.
+// When present, the real write destination is this DIR (and every positional becomes a
+// source), so it must be escape/protected-checked — otherwise `cp -t ~ payload` writes
+// OUTSIDE the tree while the classifier inspects only the positional `payload` and
+// passes. Handles `-t DIR`, `-tDIR`, `--target-directory DIR`, `--target-directory=DIR`,
+// and a short bundle ending in t (`-rt DIR`, `-it DIR`).
+func targetDirFlag(args []string) (string, bool) {
+	for i, a := range args {
+		switch {
+		case a == "-t" || a == "--target-directory":
+			if i+1 < len(args) {
+				return args[i+1], true
+			}
+		case strings.HasPrefix(a, "--target-directory="):
+			return a[len("--target-directory="):], true
+		case strings.HasPrefix(a, "-t") && !strings.HasPrefix(a, "--"):
+			return a[2:], true // -tDIR (value bundled onto the flag)
+		case strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "--") && strings.HasSuffix(a, "t"):
+			if i+1 < len(args) { // short bundle whose last flag is -t: -rt DIR, -it DIR
+				return args[i+1], true
+			}
+		}
+	}
+	return "", false
+}
+
+// nonFlagArgs returns the arguments that are not "-"-prefixed flags, in order. The
+// -t/--target-directory value flag, which would otherwise shift the true write dest, is
+// handled separately by targetDirFlag (its callers consult that first).
 func nonFlagArgs(args []string) []string {
 	var out []string
 	for _, a := range args {
