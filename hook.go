@@ -32,6 +32,20 @@ type bashToolInput struct {
 	Command string `json:"command"`
 }
 
+// fileToolInput is the Edit/Write/MultiEdit tools' input; file_path is the path we
+// check against protected paths. (Only file_path is read — the new content is
+// irrelevant to whether the path may be written at all.)
+type fileToolInput struct {
+	FilePath string `json:"file_path"`
+}
+
+// notebookToolInput is the NotebookEdit tool's input. It carries notebook_path,
+// NOT file_path — so it needs its own struct; reading file_path would always be
+// empty and silently let every notebook write through.
+type notebookToolInput struct {
+	NotebookPath string `json:"notebook_path"`
+}
+
 // hookOutput is Claude Code's PreToolUse decision JSON written to stdout.
 type hookOutput struct {
 	HookSpecificOutput hookSpecificOutput `json:"hookSpecificOutput"`
@@ -77,19 +91,41 @@ func runHook(stdin io.Reader, stdout io.Writer, fallbackRoot string) {
 	if err := json.Unmarshal(data, &ev); err != nil {
 		return // unparseable event → allow
 	}
-	if ev.ToolName != "Bash" {
-		return // only the Bash matcher is wired (see init's TODO(hook) for C2)
-	}
-	var in bashToolInput
-	if err := json.Unmarshal(ev.ToolInput, &in); err != nil || in.Command == "" {
-		return
-	}
 
 	root := ev.CWD
 	if root == "" {
 		root = fallbackRoot
 	}
-	req := guard.Request{Tool: "Bash", Command: in.Command, Root: root, Agent: "claude-code"}
+
+	// Map the agent's tool input into an agent-agnostic guard.Request. Bash carries
+	// a command line; Edit/Write/MultiEdit carry a file_path, NotebookEdit a
+	// notebook_path — all checked against protected paths. Every file-editor tool the
+	// matcher fires for needs a case here: a missing case falls through to default
+	// (fail-open allow), which would be a trivial bypass of the whole feature.
+	// All policy lives in guard — this adapter only reads the right field.
+	var req guard.Request
+	switch ev.ToolName {
+	case "Bash":
+		var in bashToolInput
+		if err := json.Unmarshal(ev.ToolInput, &in); err != nil || in.Command == "" {
+			return
+		}
+		req = guard.Request{Tool: "Bash", Command: in.Command, Root: root, Agent: "claude-code"}
+	case "Edit", "Write", "MultiEdit":
+		var in fileToolInput
+		if err := json.Unmarshal(ev.ToolInput, &in); err != nil || in.FilePath == "" {
+			return
+		}
+		req = guard.Request{Tool: ev.ToolName, FilePath: in.FilePath, Root: root, Agent: "claude-code"}
+	case "NotebookEdit":
+		var in notebookToolInput
+		if err := json.Unmarshal(ev.ToolInput, &in); err != nil || in.NotebookPath == "" {
+			return
+		}
+		req = guard.Request{Tool: ev.ToolName, FilePath: in.NotebookPath, Root: root, Agent: "claude-code"}
+	default:
+		return // unknown tool → allow
+	}
 
 	decision := classifySafe(req)
 	_ = guard.LogAttempt(req, decision) // seismograph; logging must never affect the verdict

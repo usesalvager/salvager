@@ -305,8 +305,9 @@ into another MCP client by hand, point it at the binary:
 
 Recovery is the net under the agent; interception is the rail in front of it. On
 Claude Code, `salvager init` also registers a **PreToolUse hook** (`salvager hook`,
-in `.claude/settings.local.json`) that inspects every Bash command *before* it
-runs. It is invoked by Claude Code, never by a human.
+in `.claude/settings.local.json`) that inspects every Bash command — and every
+Edit/Write target (see [Protected paths](#protected-paths)) — *before* it runs. It
+is invoked by Claude Code, never by a human.
 
 The line it draws is the honest one — **what Salvager can vs cannot recover:**
 
@@ -332,6 +333,39 @@ verbatim); nothing is uploaded.
 
 The classifier is an agent-agnostic core (`guard/`) behind a thin Claude Code
 adapter, so a second agent is a small adapter over the same, already-tested brain.
+
+## Protected paths
+
+Recovery says "you can get it back"; protection says "it must never be touched."
+They don't overlap: the watcher **cannot recover a gitignored file** — it never
+captured it — so for gitignored secrets (`.env`, private keys) *prevention is the
+only protection there is*. The hook **denies any agent write or delete to a
+protected path** — `Write`/`Edit`, and `rm` / `sed -i` / `mv` / `truncate` /
+`> redirect` — as a **Tier A deny**, even under `--dangerously-skip-permissions`.
+
+It works like antivirus definitions: a **built-in default set** plus a **user
+layer**, layered.
+
+- **Defaults** (shipped, focused on what recovery can't save): `.env`, `.env.*`,
+  `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`, `id_*`, `credentials`, `.npmrc`,
+  `.pypirc`, `.aws/**`, `.ssh/**`, `.git/**`. (`.salvager/` is already net-protected.)
+- **User layer** — `.salvager/protected`, plain text, one glob per line, `#`
+  comments. A pattern with no `/` matches a **basename** at any depth (`*.crt`); a
+  trailing `/**` matches anything under a directory (`secrets/**`); any other
+  pattern matches the full path (`config/prod.yaml`).
+- **Exclusions** — a line starting with `!` **un-protects** (an antivirus
+  exception), so a default that misfires never makes you disable the whole feature.
+  `.gitignore`-style: the last matching rule wins.
+
+```
+# .salvager/protected
+config/prod.yaml      # add: protect a non-secret too
+!.env.example         # exclude: this one is safe to write
+```
+
+A deny tells the agent what to do — defer to the user, or add a `!` exclusion —
+so it self-corrects in the same turn. Reads are never blocked; this is about
+writes and deletes only.
 
 ## How it works
 

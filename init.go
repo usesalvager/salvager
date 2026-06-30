@@ -471,8 +471,11 @@ func atomicWrite(path string, data []byte) error {
 // file degrades safe (left untouched, manual snippet printed), mirroring
 // reconcileMCP.
 //
-// TODO(hook): protected-paths layer (C2) — an Edit/Write matcher guarding
-// user-declared untouchable files. Needs its own config-surface decision.
+// The matcher covers Bash (command interception) and the file-editor tools — Edit,
+// MultiEdit, Write, NotebookEdit (protected-path guarding, C2). Claude Code matches
+// a tool name against this regex, so they share one block. A file edit whose path is
+// not protected is a fast pass in the hook; a Bash command is classified as before.
+//
 // Deferred seam: a --project-hook flag would write the committed
 // .claude/settings.json instead, for teams that want it shared.
 
@@ -480,20 +483,28 @@ func settingsLocalPath(root string) string {
 	return filepath.Join(root, ".claude", "settings.local.json")
 }
 
+// hookMatcher is the tool-name regex Salvager's PreToolUse block matches: Bash for
+// command interception, and every file-editor tool (Edit, MultiEdit, Write,
+// NotebookEdit) for protected-path guarding. Each is listed explicitly rather than
+// relying on Claude Code's substring match (where "Edit" would also catch MultiEdit/
+// NotebookEdit by accident) — explicit means the adapter's cases and this matcher
+// stay in lockstep, and a future editor tool isn't silently half-covered.
+const hookMatcher = "Bash|Edit|MultiEdit|Write|NotebookEdit"
+
 // hookCommand is the exact command string Salvager registers. The exe path is
 // left symlink-unresolved for the same reason as the MCP registration (a Homebrew
 // upgrade must not break it).
 func hookCommand(exePath string) string { return exePath + " hook" }
 
 func manualHookSnippet(exePath string) string {
-	return fmt.Sprintf(`add under hooks.PreToolUse a {"matcher":"Bash","hooks":[`+
-		`{"type":"command","command":%q,"timeout":5}]} entry`, hookCommand(exePath))
+	return fmt.Sprintf(`add under hooks.PreToolUse a {"matcher":%q,"hooks":[`+
+		`{"type":"command","command":%q,"timeout":5}]} entry`, hookMatcher, hookCommand(exePath))
 }
 
 // desiredHookBlock is the matcher block Salvager owns.
 func desiredHookBlock(exePath string) map[string]any {
 	return map[string]any{
-		"matcher": "Bash",
+		"matcher": hookMatcher,
 		"hooks": []any{
 			map[string]any{"type": "command", "command": hookCommand(exePath), "timeout": 5},
 		},
@@ -662,12 +673,16 @@ func isSalvagerHookCmd(cmd, exePath string) bool {
 }
 
 // salvagerHookState scans the PreToolUse blocks for Salvager's hook: hasCorrect is
-// true when an entry matches the current command exactly, hasWrong when a stale
-// (moved-binary) salvager entry is present. Idempotent registration needs both.
+// true when an entry matches BOTH the current command and the current matcher,
+// hasWrong when a stale salvager entry is present — a moved binary (old command) OR
+// an older block whose matcher predates the current one (e.g. P1's "Bash", or the
+// "Bash|Edit|Write" that predates MultiEdit/NotebookEdit). Both are repaired by
+// strip + re-add, so an upgrade widens the matcher; idempotent registration needs both.
 func salvagerHookState(pre []any, exePath string) (hasCorrect, hasWrong bool) {
 	desired := hookCommand(exePath)
 	for _, b := range pre {
 		block, _ := b.(map[string]any)
+		matcher, _ := block["matcher"].(string)
 		hooksArr, _ := block["hooks"].([]any)
 		for _, h := range hooksArr {
 			hm, _ := h.(map[string]any)
@@ -675,7 +690,7 @@ func salvagerHookState(pre []any, exePath string) (hasCorrect, hasWrong bool) {
 			if !isSalvagerHookCmd(cmd, exePath) {
 				continue
 			}
-			if strings.TrimSpace(cmd) == desired {
+			if strings.TrimSpace(cmd) == desired && matcher == hookMatcher {
 				hasCorrect = true
 			} else {
 				hasWrong = true
