@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -572,8 +573,8 @@ func writeSettingsFile(t *testing.T, env *initEnv, content string) {
 	}
 }
 
-// hookAdded when the settings file is absent: a fresh Bash matcher pointing at
-// this binary is written.
+// hookAdded when the settings file is absent: a fresh hook with the full file-editor
+// matcher, pointing at this binary, is written.
 func TestHook_AddedWhenAbsent(t *testing.T) {
 	env := newTestEnv(t, &fakeClaude{}, true)
 
@@ -585,8 +586,40 @@ func TestHook_AddedWhenAbsent(t *testing.T) {
 	if !ok {
 		t.Fatal("settings.local.json was not created")
 	}
-	if !strings.Contains(content, env.exePath+" hook") || !strings.Contains(content, `"Bash"`) {
-		t.Errorf("settings missing the salvager Bash hook:\n%s", content)
+	if !strings.Contains(content, env.exePath+" hook") || !strings.Contains(content, `"`+hookMatcher+`"`) {
+		t.Errorf("settings missing the salvager %s hook:\n%s", hookMatcher, content)
+	}
+}
+
+// An older install (matcher "Bash", or the "Bash|Edit|Write" that predates
+// MultiEdit/NotebookEdit) is widened to the current matcher on re-run: the old
+// matcher is treated as drift and replaced, not duplicated, so protected-path
+// guarding covers every file-editor tool after an upgrade without a manual edit.
+func TestHook_WidensOldMatcherOnUpgrade(t *testing.T) {
+	for _, old := range []string{"Bash", "Bash|Edit|Write"} {
+		t.Run(old, func(t *testing.T) {
+			env := newTestEnv(t, &fakeClaude{}, true)
+			writeSettingsFile(t, env, fmt.Sprintf(`{
+  "hooks": {"PreToolUse": [
+    {"matcher": %q, "hooks": [{"type": "command", "command": %q, "timeout": 5}]}
+  ]}
+}`, old, env.exePath+" hook"))
+
+			if r := reconcileHook(env); !r.ok || r.state != "registered" {
+				t.Fatalf("expected the %q matcher to be widened (registered), got %+v", old, r)
+			}
+			content, _ := readSettingsFile(t, env)
+			if !strings.Contains(content, `"`+hookMatcher+`"`) {
+				t.Errorf("matcher was not widened to %s:\n%s", hookMatcher, content)
+			}
+			if strings.Count(content, "salvager hook") != 1 {
+				t.Errorf("expected exactly one salvager hook after widening:\n%s", content)
+			}
+			// And it is now idempotent at the widened matcher.
+			if r := reconcileHook(env); !r.ok || r.state != "already registered for this project" {
+				t.Errorf("widened hook not idempotent on the next run: %+v", r)
+			}
+		})
 	}
 }
 

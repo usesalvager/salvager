@@ -23,10 +23,104 @@ func bashEvent(cwd, cmd string) string {
 	return string(ev)
 }
 
+// fileEvent builds a PreToolUse stdin payload for the file_path tools (Edit/Write/
+// MultiEdit).
+func fileEvent(cwd, tool, filePath string) string {
+	in, _ := json.Marshal(fileToolInput{FilePath: filePath})
+	ev, _ := json.Marshal(preToolUseEvent{
+		HookEventName: "PreToolUse",
+		CWD:           cwd,
+		ToolName:      tool,
+		ToolInput:     in,
+	})
+	return string(ev)
+}
+
+// notebookEvent builds a PreToolUse stdin payload for NotebookEdit, whose input
+// carries notebook_path (not file_path).
+func notebookEvent(cwd, notebookPath string) string {
+	in, _ := json.Marshal(notebookToolInput{NotebookPath: notebookPath})
+	ev, _ := json.Marshal(preToolUseEvent{
+		HookEventName: "PreToolUse",
+		CWD:           cwd,
+		ToolName:      "NotebookEdit",
+		ToolInput:     in,
+	})
+	return string(ev)
+}
+
 func runHookStr(event, fallback string) string {
 	var out bytes.Buffer
 	runHook(strings.NewReader(event), &out, fallback)
 	return out.String()
+}
+
+// seedProtected writes a .salvager/protected file under root.
+func seedProtected(t *testing.T, root, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, ".salvager"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".salvager", "protected"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHook_EditWriteProtected — every file-editor tool the matcher fires for is
+// mapped to a deny on a protected path, and to silence on an ordinary one. This is
+// the no-bypass guarantee: MultiEdit and NotebookEdit must be covered too, or an
+// agent skips the whole protection by picking a different editor tool. The adapter
+// holds NO policy — the deny reason is exactly what the core produces.
+func TestHook_EditWriteProtected(t *testing.T) {
+	root := t.TempDir()
+	seedProtected(t, root, "config/prod.yaml\n")
+
+	for _, tc := range []struct{ tool, path, event string }{
+		{"Write", ".env", fileEvent(root, "Write", ".env")},                       // default set
+		{"Edit", "config/prod.yaml", fileEvent(root, "Edit", "config/prod.yaml")}, // user addition
+		{"MultiEdit", ".env", fileEvent(root, "MultiEdit", ".env")},               // same file_path field as Edit/Write
+		{"NotebookEdit", ".env", notebookEvent(root, ".env")},                     // distinct notebook_path field
+	} {
+		out := runHookStr(tc.event, root)
+		var deny hookOutput
+		if err := json.Unmarshal([]byte(out), &deny); err != nil {
+			t.Fatalf("%s %s: output not JSON: %v (%q)", tc.tool, tc.path, err, out)
+		}
+		if deny.HookSpecificOutput.PermissionDecision != "deny" ||
+			deny.HookSpecificOutput.PermissionDecisionReason == "" {
+			t.Errorf("%s %s: expected a deny, got %q", tc.tool, tc.path, out)
+		}
+		want := guard.Classify(guard.Request{Tool: tc.tool, FilePath: tc.path, Root: root, Agent: "claude-code"})
+		if deny.HookSpecificOutput.PermissionDecisionReason != want.Reason {
+			t.Errorf("%s %s: adapter reason diverged from core (policy leaked into adapter)", tc.tool, tc.path)
+		}
+	}
+
+	// An ordinary path is allowed (no output), for both field shapes.
+	if out := runHookStr(fileEvent(root, "MultiEdit", "src/app.go"), root); out != "" {
+		t.Errorf("MultiEdit to an ordinary path must be silent, got %q", out)
+	}
+	if out := runHookStr(notebookEvent(root, "notebooks/run.ipynb"), root); out != "" {
+		t.Errorf("NotebookEdit to an ordinary path must be silent, got %q", out)
+	}
+}
+
+// TestHook_EditWriteFailOpen — malformed/empty Edit/Write input still fails open.
+func TestHook_EditWriteFailOpen(t *testing.T) {
+	root := t.TempDir()
+	cases := map[string]string{
+		"empty file_path":        fileEvent(root, "Edit", ""),
+		"empty notebook_path":    notebookEvent(root, ""),
+		"malformed input":        `{"hook_event_name":"PreToolUse","tool_name":"Write","tool_input":"not-an-object"}`,
+		"notebook wrong field":   `{"hook_event_name":"PreToolUse","tool_name":"NotebookEdit","tool_input":{"file_path":".env"}}`,
+		"genuinely unknown tool": `{"hook_event_name":"PreToolUse","tool_name":"WebFetch","tool_input":{"file_path":".env"}}`,
+		"missing tool_input":     `{"hook_event_name":"PreToolUse","tool_name":"Edit"}`,
+	}
+	for name, ev := range cases {
+		if out := runHookStr(ev, root); out != "" {
+			t.Errorf("%s: must fail open (no output), got %q", name, out)
+		}
+	}
 }
 
 // TestHook_DecisionShapePerTier — the adapter maps each guard tier to the right
