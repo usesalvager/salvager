@@ -88,10 +88,11 @@ its SHA-256 checksum, and puts it on your PATH:
 curl -fsSL https://raw.githubusercontent.com/usesalvager/salvager/main/install.sh | sh
 ```
 
-Pin a version or pick the install dir with environment variables:
+Pin a version (omit to get the latest) or pick the install dir with environment
+variables — `SALVAGER_VERSION` takes any tag from the [releases page](https://github.com/usesalvager/salvager/releases):
 
 ```sh
-SALVAGER_VERSION=v1.3.0 \
+SALVAGER_VERSION=v1.4.0 \
 SALVAGER_INSTALL_DIR="$HOME/.local/bin" \
   curl -fsSL https://raw.githubusercontent.com/usesalvager/salvager/main/install.sh | sh
 ```
