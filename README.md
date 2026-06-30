@@ -319,8 +319,8 @@ The line it draws is the honest one — **what Salvager can vs cannot recover:**
   agent reads and self-corrects on, in the same turn.
 - **Tier B — checkpointed, then allowed.** Destructive but recoverable *inside* the
   tree (`git reset --hard`, `git clean -fd`, `git checkout -f`, bulk `sed -i` /
-  `find -delete` / `xargs rm`). Salvager lets it proceed and hands the agent the
-  `restore-at` instant to rewind to if it goes wrong.
+  `find -delete` / `find … -exec rm` / `xargs rm`). Salvager lets it proceed and hands
+  the agent the `restore-at` instant to rewind to if it goes wrong.
 - **Everything else passes**, fast and silent.
 
 Salvager never blocks something it could have undone anyway — it only walls off
@@ -335,14 +335,23 @@ verbatim); nothing is uploaded.
 The classifier is an agent-agnostic core (`guard/`) behind a thin Claude Code
 adapter, so a second agent is a small adapter over the same, already-tested brain.
 
+**One honest limit:** the hook sees the *shell*, not what an interpreter does inside
+it. An inline write through a language runtime — `python -c "open('.env','w')…"`,
+`node -e "fs.writeFileSync('.env',…)"`, `perl -e …` — can't be parsed by a shell
+classifier and passes. Defense-in-depth still covers most of it: the watcher recovers
+anything the interpreter writes to a non-gitignored file. The one thing genuinely
+unprotected here is a *gitignored secret* written by an interpreter — recovery never
+captured it and the shell parser can't see the write. We don't pretend to close that.
+
 ## Protected paths
 
 Recovery says "you can get it back"; protection says "it must never be touched."
 They don't overlap: the watcher **cannot recover a gitignored file** — it never
 captured it — so for gitignored secrets (`.env`, private keys) *prevention is the
 only protection there is*. The hook **denies any agent write or delete to a
-protected path** — `Write`/`Edit`, and `rm` / `sed -i` / `mv` / `truncate` /
-`> redirect` — as a **Tier A deny**, even under `--dangerously-skip-permissions`.
+protected path** — `Write`/`Edit`, and `rm` / `sed -i` / `mv` / `cp` / `tee` /
+`install` / `ln` / `truncate` / `find … -exec rm` / `> redirect` — as a **Tier A
+deny**, even under `--dangerously-skip-permissions`.
 
 It works like antivirus definitions: a **built-in default set** plus a **user
 layer**, layered.

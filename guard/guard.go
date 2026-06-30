@@ -23,6 +23,14 @@
 // Never block something the net could have undone anyway; only wall off what it
 // cannot save. A missed dangerous command is still recoverable by the watcher; a
 // false deny erodes trust — so the classifier favours precision over coverage.
+//
+// Honest limit: this classifier parses SHELL file-ops, not arbitrary interpreter
+// code. An inline write through a language runtime — python -c "open('.env','w')…",
+// node -e "fs.writeFileSync('.env',…)", perl -e … — is opaque to a shell parser and
+// passes. Defence-in-depth still covers it: the watcher recovers anything the
+// interpreter writes to a non-gitignored file. The one thing genuinely unprotected at
+// this layer is a *gitignored secret* written by an interpreter (recovery never saw
+// it, and the shell parser can't see the write). We do not pretend to close that gap.
 package guard
 
 import (
@@ -187,7 +195,9 @@ func matchParen(s string, start int) (inner string, end int) {
 	return s[start:], len(s) - 1
 }
 
-// splitTop splits on unquoted separators ; && || | and newline.
+// splitTop splits on unquoted separators ; && || | and newline. A `|` immediately
+// after a `>` is the `>|` clobber-override redirect operator, not a pipe — it stays
+// in the clause so redirectTargets can judge its file target.
 func splitTop(s string) []string {
 	var out []string
 	var b strings.Builder
@@ -219,6 +229,10 @@ func splitTop(s string) []string {
 			}
 			flush()
 		case '|':
+			if i > 0 && s[i-1] == '>' {
+				b.WriteByte(c) // `>|` clobber-override redirect, not a pipe
+				continue
+			}
 			if i+1 < len(s) && s[i+1] == '|' {
 				i++
 			}
@@ -315,8 +329,12 @@ func classifyClause(clause, root string) Decision {
 		return classifyGit(args)
 	case "sed":
 		return classifySed(args, root)
-	case "mv":
-		return classifyMv(args, root)
+	case "mv", "tee":
+		// C2-scoped: every non-flag path arg is a write/delete target.
+		return denyAnyProtectedArg(args, root)
+	case "cp", "install", "ln":
+		// C2-scoped: the destination (last non-flag arg) is the write target.
+		return denyProtectedDest(args, root)
 	case "find":
 		return classifyFind(args, root)
 	case "truncate":
@@ -576,35 +594,66 @@ func classifySed(args []string, root string) Decision {
 	return checkpoint("sed-i")
 }
 
-// classifyFind flags `find ... -delete`. Its search roots are the path tokens
-// before the first predicate (the first `-`-prefixed token); a root outside the
-// tree (find / -delete, find ~ -delete) is unrecoverable.
+// classifyFind flags a destructive find: `-delete`, or an `-exec`/`-execdir` whose
+// command is a destructive verb (rm, mv, truncate, …) — `find . -name .env -exec rm
+// {} \;` deletes just as `-delete` does. Search roots are the path tokens before the
+// first predicate; a root outside the tree (find / …, find ~ …) is unrecoverable, and
+// a protected path named anywhere in the expression (a root, or a -name/-path operand
+// naming a protected file to delete) is a protected deny. Inside the tree → checkpoint.
 func classifyFind(args []string, root string) Decision {
-	hasDelete := false
-	for _, a := range args {
-		if a == "-delete" {
-			hasDelete = true
-			break
-		}
-	}
-	if !hasDelete {
+	if !findDestructive(args) {
 		return pass()
 	}
+	// Search roots only (judged for tree-escape): a -path/-name value that happens to
+	// look absolute is an operand, not a walk root, so net/outside is checked here.
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") {
 			break // predicates start here; search roots are done
 		}
+		switch pathClass(a, root) {
+		case pathNet:
+			return denyNet("find", a)
+		case pathOutside:
+			return denyOutside("find", a)
+		}
+	}
+	// A protected path named anywhere in a destructive find is a protected deny.
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") || a == "{}" || a == ";" || a == `\;` || a == "+" {
+			continue // a flag/predicate or find's -exec syntax, not a target path
+		}
 		if d, ok := protectedDeny(a, root); ok {
 			return d
 		}
-		switch pathClass(a, root) {
-		case pathNet:
-			return denyNet("find -delete", a)
-		case pathOutside:
-			return denyOutside("find -delete", a)
+	}
+	return checkpoint("find-destructive")
+}
+
+// findDestructive reports whether a find expression deletes: a -delete predicate, or
+// an -exec/-execdir running a destructive verb. Conservative — an -exec sh -c "…" is
+// NOT expanded (the inner is opaque shell, the documented interpreter limit), only a
+// directly-named destructive verb counts.
+func findDestructive(args []string) bool {
+	for i, a := range args {
+		if a == "-delete" {
+			return true
+		}
+		if (a == "-exec" || a == "-execdir") && i+1 < len(args) &&
+			isDestructiveVerb(filepath.Base(args[i+1])) {
+			return true
 		}
 	}
-	return checkpoint("find-delete")
+	return false
+}
+
+// isDestructiveVerb reports whether a command name (an -exec target, say) destroys
+// files. Kept to verbs that always write/delete, so a benign -exec stays a pass.
+func isDestructiveVerb(base string) bool {
+	switch base {
+	case "rm", "mv", "truncate", "shred", "dd":
+		return true
+	}
+	return false
 }
 
 // classifyTruncate flags `truncate` (it shortens/zeroes a file). Inside the tree
@@ -644,11 +693,12 @@ func classifyTruncate(args []string, root string) Decision {
 	return checkpoint("truncate")
 }
 
-// classifyMv flags an mv whose source or destination is a protected path: moving a
-// protected file away destroys it at its location, and moving onto one overwrites
-// it. This handler is C2-scoped — it adds only the protected check; mv was not
-// otherwise classified by P1, so a non-protected mv passes (the watcher recovers it).
-func classifyMv(args []string, root string) Decision {
+// denyAnyProtectedArg is the C2-scoped check for commands whose EVERY non-flag path
+// argument is a write/delete target: mv (moving a protected file away destroys it at
+// its location, moving onto one overwrites it) and tee (writes every file operand). A
+// protected hit is a Tier A deny; anything else passes — these were not otherwise
+// classified by P1, so a non-protected use stays silent (the watcher recovers it).
+func denyAnyProtectedArg(args []string, root string) Decision {
 	for _, a := range args {
 		if strings.HasPrefix(a, "-") {
 			continue // a flag (-f, -v, …), not a path
@@ -658,6 +708,32 @@ func classifyMv(args []string, root string) Decision {
 		}
 	}
 	return pass()
+}
+
+// denyProtectedDest is the C2-scoped check for commands whose write target is the
+// LAST non-flag argument: cp / install (… src dest) and ln (target linkname, which
+// -f clobbers). A protected destination is a Tier A deny; anything else passes. A
+// protected SOURCE is only read, and reads aren't guarded — so only the dest matters.
+func denyProtectedDest(args []string, root string) Decision {
+	if dst, ok := lastNonFlag(args); ok {
+		if d, ok := protectedDeny(dst, root); ok {
+			return d
+		}
+	}
+	return pass()
+}
+
+// lastNonFlag returns the last argument that is not a "-"-prefixed flag — the
+// destination operand for cp/install/ln-style commands. A bundled value flag
+// (cp -t DIR) could shift the true dest, but that's an obscure form; taking the last
+// operand is the conservative reading and never over-denies a non-protected dest.
+func lastNonFlag(args []string) (string, bool) {
+	for i := len(args) - 1; i >= 0; i-- {
+		if !strings.HasPrefix(args[i], "-") {
+			return args[i], true
+		}
+	}
+	return "", false
 }
 
 // fileTargets returns ts[skip:] (its leading non-file tokens dropped). root is
@@ -737,9 +813,10 @@ func pathClass(token, root string) int {
 	return pathOutside // ancestor of root, or fully outside
 }
 
-// redirectTargets returns the file targets of any >/>> redirections in a clause,
-// so a redirect that writes into the net or outside the tree can be denied. fd
-// duplications (2>&1) are not file writes and are skipped.
+// redirectTargets returns the file targets of any >/>>/>| redirections in a clause,
+// so a redirect that writes into the net or outside the tree can be denied. It covers
+// the clobber forms (>, >>, >| with -o noclobber overridden); fd duplications
+// (2>&1, >&2) are not file writes and are skipped.
 func redirectTargets(toks []string) []string {
 	var out []string
 	for i := 0; i < len(toks); i++ {
@@ -757,6 +834,7 @@ func redirectTargets(toks []string) []string {
 		default:
 			continue
 		}
+		rest = strings.TrimPrefix(rest, "|") // >| clobber-override: the file follows the bar
 		if strings.HasPrefix(rest, "&") {
 			continue // fd dup, not a file
 		}
