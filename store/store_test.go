@@ -1,6 +1,7 @@
 package store
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -94,6 +95,68 @@ func TestRecordInitialAndModify(t *testing.T) {
 	}
 	if revs[0].Timestamp <= revs[1].Timestamp {
 		t.Errorf("timestamps not increasing: %d then %d", revs[1].Timestamp, revs[0].Timestamp)
+	}
+}
+
+func TestMaxBytesResolution(t *testing.T) {
+	s := New(t.TempDir())
+	if got := s.MaxFileBytes(); got != DefaultMaxFileBytes { // 0 => default
+		t.Errorf("default cap = %d, want %d", got, DefaultMaxFileBytes)
+	}
+	s.SetMaxFileBytes(-1) // negative => no limit
+	if got := s.MaxFileBytes(); got != math.MaxInt64 {
+		t.Errorf("unlimited cap = %d, want MaxInt64", got)
+	}
+	s.SetMaxFileBytes(1234) // positive => exact
+	if got := s.MaxFileBytes(); got != 1234 {
+		t.Errorf("explicit cap = %d, want 1234", got)
+	}
+}
+
+func TestRecordSizeCap(t *testing.T) {
+	fakeClock(t)
+	root := t.TempDir()
+	s := New(root)
+	s.SetMaxFileBytes(16) // tiny cap so a few bytes trip it
+
+	// Over the cap on first sight → skipped entirely: no revision, no object.
+	write(t, root, "big.log", strings.Repeat("x", 100))
+	if err := s.Record("big.log"); err != nil {
+		t.Fatal(err)
+	}
+	if revs, _ := s.List("big.log"); len(revs) != 0 {
+		t.Fatalf("oversized file got %d revisions, want 0", len(revs))
+	}
+	if objs := objectNames(t, root); len(objs) != 0 {
+		t.Fatalf("oversized file wrote %d objects, want 0", len(objs))
+	}
+
+	// Under the cap → tracked normally.
+	write(t, root, "small.txt", "ok")
+	if err := s.Record("small.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if revs, _ := s.List("small.txt"); len(revs) != 1 {
+		t.Fatalf("small file got %d revisions, want 1", len(revs))
+	}
+
+	// A tracked small file that grows past the cap freezes: the giant new content
+	// is never stored, history stays at the last in-budget revision.
+	write(t, root, "small.txt", strings.Repeat("y", 100))
+	if err := s.Record("small.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if revs, _ := s.List("small.txt"); len(revs) != 1 {
+		t.Fatalf("grown file got %d revisions, want 1 (frozen)", len(revs))
+	}
+
+	// Unlimited (-1) tracks the big file that was skipped above.
+	s.SetMaxFileBytes(-1)
+	if err := s.Record("big.log"); err != nil {
+		t.Fatal(err)
+	}
+	if revs, _ := s.List("big.log"); len(revs) != 1 {
+		t.Fatalf("unlimited: big file got %d revisions, want 1", len(revs))
 	}
 }
 
