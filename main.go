@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -43,7 +44,7 @@ const usage = `salvager — local history for agents
 Usage:
   salvager init [--no-claude-md] [--undo]
                                     connect this project's agent (MCP + CLAUDE.md)
-  salvager watch [--root <path>] [--allow-partial]
+  salvager watch [--root <path>] [--allow-partial] [--max-file-size 50M]
                                     start the watcher (runs until killed)
   salvager service install | uninstall | status [--json]
                                     run the watcher as a persistent service
@@ -109,42 +110,63 @@ func main() {
 // overrides the root with an explicit absolute path (resolved via filepath.Abs);
 // absent, the root is returned unchanged — zero regression for existing usage.
 // Kept pure so the flag contract is unit-testable without starting a watcher.
-func parseWatchFlags(root string, args []string) (string, bool, error) {
+// maxFile is the per-file size cap to hand the store: -2 means the flag was
+// absent (leave the store default), -1 means unlimited, otherwise a byte count.
+func parseWatchFlags(root string, args []string) (string, bool, int64, error) {
 	allowPartial := false
+	maxFile := int64(-2) // sentinel: flag absent -> store keeps its default cap
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--allow-partial":
 			allowPartial = true
+		case "--max-file-size":
+			if i+1 >= len(args) {
+				return root, false, -2, fmt.Errorf("--max-file-size requires a size (e.g. 50M, or 0/off for no limit)")
+			}
+			switch v := args[i+1]; v {
+			case "off", "none", "unlimited", "0":
+				maxFile = -1 // no limit
+			default:
+				n, err := parseMaxBytes(v)
+				if err != nil {
+					return root, false, -2, err
+				}
+				maxFile = n
+			}
+			i++
 		case "--root":
 			if i+1 >= len(args) {
-				return root, false, fmt.Errorf("--root requires a path")
+				return root, false, -2, fmt.Errorf("--root requires a path")
 			}
 			// Reject a following flag token, so `watch --root --allow-partial`
 			// fails loudly instead of silently treating "--allow-partial" as the
 			// path (and then watching a directory literally named that).
 			if strings.HasPrefix(args[i+1], "-") {
-				return root, false, fmt.Errorf("--root requires a path, got flag %q", args[i+1])
+				return root, false, -2, fmt.Errorf("--root requires a path, got flag %q", args[i+1])
 			}
 			abs, err := filepath.Abs(args[i+1])
 			if err != nil {
-				return root, false, err
+				return root, false, -2, err
 			}
 			root = abs
 			i++
 		default:
-			return root, false, fmt.Errorf("unknown flag %q", args[i])
+			return root, false, -2, fmt.Errorf("unknown flag %q", args[i])
 		}
 	}
-	return root, allowPartial, nil
+	return root, allowPartial, maxFile, nil
 }
 
 func cmdWatch(root string, args []string) {
-	root, allowPartial, err := parseWatchFlags(root, args)
+	root, allowPartial, maxFile, err := parseWatchFlags(root, args)
 	if err != nil {
-		fatalf("%v\nusage: salvager watch [--root <path>] [--allow-partial]", err)
+		fatalf("%v\nusage: salvager watch [--root <path>] [--allow-partial] [--max-file-size <size>]", err)
 	}
 
 	s := store.New(root)
+	if maxFile != -2 {
+		s.SetMaxFileBytes(maxFile) // -1 => unlimited, else byte cap
+	}
 	if err := s.Init(); err != nil {
 		fatal(err)
 	}
@@ -164,7 +186,11 @@ func cmdWatch(root string, args []string) {
 		close(done)
 	}()
 
-	fmt.Fprintf(os.Stderr, "salvager: watching %s (Ctrl-C to stop)\n", root)
+	capStr := "unlimited"
+	if eff := s.MaxFileBytes(); eff < math.MaxInt64 {
+		capStr = humanBytes(eff)
+	}
+	fmt.Fprintf(os.Stderr, "salvager: watching %s (max file size %s, Ctrl-C to stop)\n", root, capStr)
 	if err := w.Run(done); err != nil {
 		fatal(err)
 	}

@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -171,13 +172,46 @@ var nowFunc = func() int64 { return time.Now().UnixMilli() }
 
 // FS is a filesystem-backed Store rooted at a project directory.
 type FS struct {
-	root string
-	mu   sync.Mutex // serializes all writes for the v1 (simple first)
+	root         string
+	mu           sync.Mutex // serializes all writes for the v1 (simple first)
+	maxFileBytes int64      // 0 => DefaultMaxFileBytes; negative => no limit
 }
+
+// DefaultMaxFileBytes caps the size of a single file the store will snapshot. A
+// content-addressed store keeps every version whole with no delta, so one large,
+// frequently rewritten file is its worst case: a 150 MB log appended on every
+// request writes a whole new 150 MB object per change and balloons the store into
+// hundreds of GB. 50 MiB sits well above any source file yet below the build
+// artifacts, media, datasets and logs that drive runaway growth. Override per
+// store with SetMaxFileBytes.
+const DefaultMaxFileBytes = 50 << 20 // 50 MiB
 
 // New returns a Store rooted at root. The .salvager/ directory is created lazily.
 func New(root string) *FS {
 	return &FS{root: root}
+}
+
+// SetMaxFileBytes overrides the per-file snapshot size cap: a positive value sets
+// the limit in bytes, 0 restores the default, and a negative value disables the
+// cap entirely (track files of any size). Set before recording; like
+// SetAllowPartial on the watcher, it is construction-time configuration.
+func (s *FS) SetMaxFileBytes(n int64) { s.maxFileBytes = n }
+
+// MaxFileBytes reports the effective per-file cap in bytes: math.MaxInt64 means
+// no limit. Exposed so a caller (the watch command) can report the active cap.
+func (s *FS) MaxFileBytes() int64 { return s.maxBytes() }
+
+// maxBytes resolves the effective cap: the configured value, the default when
+// unset (0), or math.MaxInt64 as the "no limit" sentinel (negative).
+func (s *FS) maxBytes() int64 {
+	switch {
+	case s.maxFileBytes == 0:
+		return DefaultMaxFileBytes
+	case s.maxFileBytes < 0:
+		return math.MaxInt64
+	default:
+		return s.maxFileBytes
+	}
 }
 
 // Init eagerly creates the .salvager/ skeleton (objects/ and index/). The watcher
@@ -309,6 +343,19 @@ func (s *FS) record(relPath string, force Label) error {
 		return s.appendLog(relPath, LabelDelete, last.Hash, computeSig(nil, last, hasLast))
 	}
 	defer f.Close()
+
+	// Size cap: the store keeps every version whole, so a large, frequently
+	// rewritten file (a 150 MB log appended on every request) would write a whole
+	// new object per change and balloon the store without bound. Skip snapshotting
+	// anything over the cap — freezing whatever history it already has rather than
+	// growing forever. force != "" (a restore's pre-restore safeguard) bypasses the
+	// cap so a restore net is never silently dropped; deletions are handled above,
+	// so a capped file that later disappears still records its delete.
+	if force == "" {
+		if fi, statErr := f.Stat(); statErr == nil && fi.Size() > s.maxBytes() {
+			return nil
+		}
+	}
 
 	// Stream the file once: object write, hash and content signal all computed
 	// in a single pass over a fixed buffer, so resident memory stays O(bufSize)

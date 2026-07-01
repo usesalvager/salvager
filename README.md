@@ -189,9 +189,15 @@ revision of every tracked file on startup, then captures every change (debounced
 directory; without it, the working directory is used. `service install` is the
 recommended default; this is the run-it-by-hand path.
 
+Files larger than **50 MiB are skipped** by default. The store keeps every
+version whole, so one big, frequently rewritten file (a `storage/logs/laravel.log`
+appended on every request) would write a whole new object per change and grow the
+store without bound. `--max-file-size <size>` overrides the cap (`50M`, `1G`, or
+`off`/`0` for no limit); the startup line reports the active value.
+
 ```
 salvager init [--no-claude-md] [--undo]  connect this project's agent
-salvager watch [--root <path>] [--allow-partial]  start the watcher (until killed)
+salvager watch [--root <path>] [--allow-partial] [--max-file-size 50M]  start the watcher (until killed)
 salvager service install | uninstall | status [--json]  run the watcher as a service
 salvager history <file>           list recorded versions of a file
 salvager show <file> <ts>         print the content of one version

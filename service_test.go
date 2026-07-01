@@ -329,25 +329,36 @@ func TestStatusJSONShape(t *testing.T) {
 func TestParseWatchFlags(t *testing.T) {
 	cwd := "/cwd/project"
 
-	// no flag → root unchanged, allowPartial false
-	r, ap, err := parseWatchFlags(cwd, nil)
-	if err != nil || r != cwd || ap {
-		t.Errorf("no-flag: got (%q,%v,%v)", r, ap, err)
+	// no flag → root unchanged, allowPartial false, cap absent (-2)
+	r, ap, mf, err := parseWatchFlags(cwd, nil)
+	if err != nil || r != cwd || ap || mf != -2 {
+		t.Errorf("no-flag: got (%q,%v,%v,%v)", r, ap, mf, err)
 	}
 
 	// --root <abs> → that abs path
-	r, _, err = parseWatchFlags(cwd, []string{"--root", "/abs/elsewhere"})
+	r, _, _, err = parseWatchFlags(cwd, []string{"--root", "/abs/elsewhere"})
 	if err != nil || r != "/abs/elsewhere" {
 		t.Errorf("--root abs: got (%q,%v)", r, err)
 	}
 
 	// --allow-partial alone
-	if _, ap, _ := parseWatchFlags(cwd, []string{"--allow-partial"}); !ap {
+	if _, ap, _, _ := parseWatchFlags(cwd, []string{"--allow-partial"}); !ap {
 		t.Errorf("--allow-partial not parsed")
 	}
 
+	// --max-file-size <size> → byte cap; off → unlimited (-1)
+	if _, _, mf, err := parseWatchFlags(cwd, []string{"--max-file-size", "10M"}); err != nil || mf != 10<<20 {
+		t.Errorf("--max-file-size 10M: got (%v,%v)", mf, err)
+	}
+	if _, _, mf, err := parseWatchFlags(cwd, []string{"--max-file-size", "off"}); err != nil || mf != -1 {
+		t.Errorf("--max-file-size off: got (%v,%v)", mf, err)
+	}
+	if _, _, _, err := parseWatchFlags(cwd, []string{"--max-file-size"}); err == nil {
+		t.Errorf("--max-file-size without value should error")
+	}
+
 	// --root with no value → error
-	if _, _, err := parseWatchFlags(cwd, []string{"--root"}); err == nil {
+	if _, _, _, err := parseWatchFlags(cwd, []string{"--root"}); err == nil {
 		t.Errorf("--root without value should error")
 	}
 
