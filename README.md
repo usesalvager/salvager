@@ -281,6 +281,31 @@ first until it's back under the limit, always keeping each file's most recent
 revision and never breaking a restore's reversibility. Run it manually or once a
 day.
 
+## Compatibility
+
+Salvager has two capabilities with different reach:
+
+- **Recovery** (per-file history + point-in-time restore, over CLI and MCP) —
+  works with **any agent**. The watcher is filesystem-level and the restore
+  tools are exposed over MCP, so any MCP-capable agent (or you, from the CLI)
+  can recover. No per-agent work needed.
+- **Interception** (the `PreToolUse` guard, Tier A deny / Tier B checkpoint) —
+  today, **Claude Code**. The guard core is agent-agnostic; each agent needs a
+  thin adapter (~100 lines) mapping its pre-execution hook to `guard.Classify`.
+
+| Agent | Recovery | Interception |
+|---|---|---|
+| Claude Code | ✅ | ✅ |
+| Any MCP-capable agent | ✅ | — |
+| Cursor · Aider · Cline · Codex · … | ✅ (watcher + MCP) | 🗺️ planned / help wanted |
+
+### Roadmap — interception adapters
+
+The guard core is done; adding an agent is a thin adapter, not a rewrite. If
+your agent exposes a pre-tool/pre-execution hook, an adapter is ~100 lines —
+issues and PRs welcome. We prioritize by demand, so tell us which agent you
+want.
+
 ## MCP
 
 `salvager mcp` exposes four tools over stdio:
